@@ -652,9 +652,14 @@ describe('isFailoverError', () => {
 describe('ForegroundFallbackManager (disabled)', () => {
   test('does nothing when enabled=false', async () => {
     const { mocks } = createMockClient();
-    const mgr = new ForegroundFallbackManager(makeChains(), false, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      false,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'session.error',
@@ -678,9 +683,14 @@ describe('ForegroundFallbackManager session.error', () => {
 
   beforeEach(() => {
     ({ mocks } = createMockClient());
-    mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
   });
 
   test('triggers fallback on rate-limit session.error', async () => {
@@ -945,9 +955,14 @@ describe('ForegroundFallbackManager session.error', () => {
         },
       ],
     }));
-    mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'message.updated',
@@ -989,9 +1004,14 @@ describe('ForegroundFallbackManager session.error', () => {
         },
       ],
     }));
-    mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'message.updated',
@@ -1044,9 +1064,14 @@ describe('ForegroundFallbackManager session.error', () => {
         };
       },
     }));
-    mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'message.updated',
@@ -1087,9 +1112,14 @@ describe('ForegroundFallbackManager session.error', () => {
           : { error: { message: 'full down' }, data: [] };
       },
     }));
-    mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'message.updated',
@@ -1170,7 +1200,7 @@ describe('ForegroundFallbackManager session.error', () => {
       makeChains(),
       true,
       { directory: '/test', hostFlavor: options?.v2 ? 'v2' : undefined } as any,
-      3,
+      0,
       undefined,
       options?.modelChanged,
       0,
@@ -1350,9 +1380,14 @@ describe('ForegroundFallbackManager session.error', () => {
         },
       ],
     }));
-    mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'message.updated',
@@ -1391,9 +1426,14 @@ describe('ForegroundFallbackManager session.error', () => {
         { id: 'm2', type: 'user', text: 'v2 prompt' },
       ],
     }));
-    mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'message.updated',
@@ -1435,9 +1475,14 @@ describe('ForegroundFallbackManager session.error', () => {
   });
 
   test('does nothing when no chain configured for session', async () => {
-    const emptyMgr = new ForegroundFallbackManager({}, true, {
-      directory: '/test',
-    } as any);
+    const emptyMgr = new ForegroundFallbackManager(
+      {},
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
     await emptyMgr.handleEvent({
       type: 'session.error',
       properties: {
@@ -1452,9 +1497,14 @@ describe('ForegroundFallbackManager session.error', () => {
 
   test('does not abort when promptAsync is unavailable', async () => {
     const { mocks } = createMockClient({ includePromptAsync: false });
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'session.error',
@@ -1477,9 +1527,14 @@ describe('ForegroundFallbackManager session.error', () => {
         // abort succeeds on first call
       },
     });
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'session.error',
@@ -1516,9 +1571,14 @@ describe('ForegroundFallbackManager session.error', () => {
     currentMockSession = session;
     installGetClientMock();
 
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'session.error',
@@ -1544,7 +1604,7 @@ describe('ForegroundFallbackManager session.error', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
       undefined,
       onModelChanged,
     );
@@ -1577,10 +1637,15 @@ describe('ForegroundFallbackManager session.error', () => {
 
   test('v2 host promptBody requests a required model switch', async () => {
     const { mocks } = createMockClient();
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-      hostFlavor: 'v2',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+        hostFlavor: 'v2',
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'message.updated',
@@ -1619,7 +1684,7 @@ describe('ForegroundFallbackManager session.error', () => {
       makeChains(),
       true,
       { directory: '/test', hostFlavor: 'v2', client: { tui: { showToast } } },
-      3,
+      0,
       undefined,
       onModelChanged,
     );
@@ -1703,10 +1768,15 @@ describe('ForegroundFallbackManager session.error', () => {
   test('shows a toast when fallback switches models on a transient error', async () => {
     const { mocks } = createMockClient();
     const showToast = mock(async () => ({}));
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-      client: { tui: { showToast } },
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+        client: { tui: { showToast } },
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'message.updated',
@@ -1741,10 +1811,15 @@ describe('ForegroundFallbackManager session.error', () => {
   test('does not toast when fallback is triggered by an inline 410/401 error', async () => {
     const { mocks } = createMockClient();
     const showToast = mock(async () => ({}));
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-      client: { tui: { showToast } },
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+        client: { tui: { showToast } },
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'message.updated',
@@ -1773,10 +1848,15 @@ describe('ForegroundFallbackManager session.error', () => {
   test('does not toast when the inline 410 error arrives as a bare string', async () => {
     const { mocks } = createMockClient();
     const showToast = mock(async () => ({}));
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-      client: { tui: { showToast } },
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+        client: { tui: { showToast } },
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'message.updated',
@@ -1813,6 +1893,7 @@ describe('ForegroundFallbackManager session.error', () => {
       },
       true,
       { directory: '/test' } as any,
+      0,
     );
 
     await mgr.handleEvent({
@@ -1853,9 +1934,14 @@ describe('ForegroundFallbackManager session.error', () => {
 describe('ForegroundFallbackManager message.updated', () => {
   test('tracks model from message.updated and falls back on error', async () => {
     const { mocks } = createMockClient();
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'message.updated',
@@ -1881,9 +1967,14 @@ describe('ForegroundFallbackManager message.updated', () => {
 
   test('uses agent name from message.updated to select correct chain', async () => {
     const { mocks } = createMockClient();
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     // explorer message with its model
     await mgr.handleEvent({
@@ -2223,7 +2314,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2275,7 +2366,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2337,7 +2428,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2379,7 +2470,7 @@ describe('ForegroundFallbackManager session.status', () => {
       },
     });
     const input = { directory: '/test' } as any;
-    const mgr = new ForegroundFallbackManager(makeChains(), true, input, 3);
+    const mgr = new ForegroundFallbackManager(makeChains(), true, input, 0);
     mgr.registerSessionAgent(sessionID, 'orchestrator');
     await mgr.handleEvent({
       type: 'session.created',
@@ -2453,7 +2544,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2535,7 +2626,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
     mgr = manager;
 
@@ -2576,7 +2667,7 @@ describe('ForegroundFallbackManager session.status', () => {
       }),
       true,
       { directory: '/test' } as any,
-      1,
+      0,
     );
 
     mgr.registerSessionAgent('child-oracle-sticky', 'oracle');
@@ -2615,7 +2706,7 @@ describe('ForegroundFallbackManager session.status', () => {
       }),
       true,
       { directory: '/test' } as any,
-      1,
+      0,
     );
 
     mgr.registerSessionAgent('child-oracle-agent-body', 'oracle');
@@ -2655,7 +2746,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      1,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2686,7 +2777,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      1,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2713,9 +2804,14 @@ describe('ForegroundFallbackManager session.status', () => {
 
   test('ignores session.status with non-rate-limit retry message', async () => {
     const { mocks } = createMockClient();
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'session.status',
@@ -2734,7 +2830,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2768,7 +2864,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2802,7 +2898,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2836,7 +2932,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      1,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2868,7 +2964,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      1,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2897,10 +2993,15 @@ describe('ForegroundFallbackManager session.status', () => {
   test('does not toast when 410 signal arrives via status.message with no error property', async () => {
     const { mocks } = createMockClient();
     const showToast = mock(async () => ({}));
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-      client: { tui: { showToast } },
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+        client: { tui: { showToast } },
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'message.updated',
@@ -2933,7 +3034,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2991,7 +3092,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     // Seed session with model A (anthropic/claude-opus-4-5)
@@ -3067,8 +3168,8 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      1,
-    ); // maxRetries=1 for immediate fallback
+      0,
+    ); // maxRetries=0: fall through on the first error (cascade-focused test)
 
     // Seed session with model A
     await mgr.handleEvent({
@@ -3140,9 +3241,14 @@ describe('ForegroundFallbackManager session.status', () => {
 describe('ForegroundFallbackManager chain exhaustion', () => {
   test('re-walks from the second chain entry on each new user turn', async () => {
     const { mocks } = createMockClient();
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
     const sessionID = 'sess-turns';
 
     await mgr.handleEvent({
@@ -3225,6 +3331,7 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
       { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
       true,
       { directory: '/test' } as any,
+      0,
     );
     const sessionID = 'sess-recover-after-abort';
 
@@ -3294,9 +3401,14 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
 
   test('does not fall back onto an earlier chain entry', async () => {
     const { mocks } = createMockClient();
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
     const sessionID = 'sess-mid-chain';
 
     await mgr.handleEvent({
@@ -3331,9 +3443,14 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
 
   test('does not fall back onto the primary when the current model is off-chain', async () => {
     const { mocks } = createMockClient();
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
     const sessionID = 'sess-off-chain';
 
     await mgr.handleEvent({
@@ -3399,6 +3516,7 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
       { orchestrator: ['a/1', 'b/2', 'c/3'] },
       true,
       { directory: '/test' } as any,
+      0,
     );
     const sessionID = 'sess-inferred-model';
 
@@ -3443,6 +3561,7 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
       { orchestrator: ['openai/gpt-b'] },
       true,
       { directory: '/test' } as any,
+      0,
     );
 
     // Seed current model as the only chain entry
@@ -3476,9 +3595,14 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
     // (each on a distinct session so dedup does not interfere).
     const { mocks } = createMockClient();
     const chain = ['openai/model-x', 'openai/model-y'];
-    const mgr = new ForegroundFallbackManager({ orchestrator: chain }, true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: chain },
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     // Session A: current model is model-x, which IS in the chain → picks model-y ✓
     await mgr.handleEvent({
@@ -3503,6 +3627,7 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
       { orchestrator: ['openai/model-y'] }, // single-entry chain already in use
       true,
       { directory: '/test' } as any,
+      0,
     );
     await mgr2.handleEvent({
       type: 'message.updated',
@@ -3531,6 +3656,7 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
       { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
       true,
       { directory: '/test' } as any,
+      0,
     );
 
     await mgr.handleEvent({
@@ -3587,9 +3713,14 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
 
   test('clears exhaustion state on a successful response (sticky fallback recovered)', async () => {
     const { mocks } = createMockClient();
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'message.updated',
@@ -3653,6 +3784,7 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
       { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
       true,
       { directory: '/test' } as any,
+      0,
     );
 
     await mgr.handleEvent({
@@ -3718,6 +3850,7 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
       { orchestrator: ['openai/gpt-b'] },
       true,
       { directory: '/test' } as any,
+      0,
     );
 
     await mgr.handleEvent({
@@ -4079,9 +4212,14 @@ describe('ForegroundFallbackManager inherit + fallback chain', () => {
 describe('ForegroundFallbackManager deduplication', () => {
   test('ignores a second trigger within dedup window for same session', async () => {
     const { mocks } = createMockClient();
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     const event = {
       type: 'session.error',
@@ -4099,9 +4237,14 @@ describe('ForegroundFallbackManager deduplication', () => {
 
   test('different sessions are not deduplicated against each other', async () => {
     const { mocks } = createMockClient();
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'session.error',
@@ -4117,9 +4260,14 @@ describe('ForegroundFallbackManager deduplication', () => {
 
   test('cascade continues when second error arrives within dedup window after model switch', async () => {
     const { mocks } = createMockClient();
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     // Seed session: current model is first entry in orchestrator chain
     await mgr.handleEvent({
@@ -4182,9 +4330,14 @@ describe('ForegroundFallbackManager deduplication', () => {
 describe('ForegroundFallbackManager subagent.session.created', () => {
   test('records agent name from subagent.session.created and falls back correctly', async () => {
     const { mocks } = createMockClient();
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     // Register the session as 'explorer' via subagent creation event
     await mgr.handleEvent({
@@ -4224,7 +4377,7 @@ describe('ForegroundFallbackManager session.deleted', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
       coordinator,
     );
 
@@ -4267,9 +4420,14 @@ describe('ForegroundFallbackManager session.deleted', () => {
   });
 
   test('ignores session.deleted with no sessionID', async () => {
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
     // Should not throw
     await expect(
       mgr.handleEvent({ type: 'session.deleted', properties: {} }),
@@ -4283,7 +4441,7 @@ describe('ForegroundFallbackManager session.deleted', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
       coordinator,
     );
 
@@ -4322,7 +4480,7 @@ describe('ForegroundFallbackManager session.deleted', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
       coordinator,
     );
 
@@ -4365,25 +4523,40 @@ describe('ForegroundFallbackManager session.deleted', () => {
 
 describe('ForegroundFallbackManager willAttemptFallback', () => {
   test('returns true when the session has a chain and it is not exhausted', () => {
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
     mgr.registerSessionAgent('sess-1', 'orchestrator');
     expect(mgr.willAttemptFallback('sess-1')).toBe(true);
   });
 
   test('returns false when fallback is disabled', () => {
-    const mgr = new ForegroundFallbackManager(makeChains(), false, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      false,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
     mgr.registerSessionAgent('sess-1', 'orchestrator');
     expect(mgr.willAttemptFallback('sess-1')).toBe(false);
   });
 
   test('returns false for a known agent without a configured chain', () => {
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
     // oracle has no chain in makeChains(); resolveChain must not bleed
     // into another agent's chain, so no fallback is possible.
     mgr.registerSessionAgent('sess-oracle', 'oracle');
@@ -4391,18 +4564,28 @@ describe('ForegroundFallbackManager willAttemptFallback', () => {
   });
 
   test('returns false when the chain is exhausted (stage 2)', () => {
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
     mgr.registerSessionAgent('sess-1', 'orchestrator');
     (mgr as any).chainExhaustion.set('sess-1', 2);
     expect(mgr.willAttemptFallback('sess-1')).toBe(false);
   });
 
   test('returns true while a fallback is in flight even after exhaustion', () => {
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
     (mgr as any).inProgress.add('sess-1');
     expect(mgr.willAttemptFallback('sess-1')).toBe(true);
   });
@@ -4425,6 +4608,7 @@ describe('ForegroundFallbackManager resolveChain cross-agent isolation', () => {
       },
       true,
       { directory: '/test' } as any,
+      0,
     );
 
     await mgr.handleEvent({
@@ -4452,6 +4636,7 @@ describe('ForegroundFallbackManager resolveChain cross-agent isolation', () => {
       { orchestrator: ['openai/gpt-4o'] },
       true,
       { directory: '/test' } as any,
+      0,
     );
 
     // No agent name tracked, no model tracked - triggers session.error
@@ -4481,6 +4666,7 @@ describe('ForegroundFallbackManager resolveChain cross-agent isolation', () => {
       { orchestrator: ['openai/gpt-6', 'new-api/glm-5.2'] },
       true,
       { directory: '/test' } as any,
+      0,
     );
 
     await mgr.handleEvent({
@@ -4515,7 +4701,7 @@ describe('ForegroundFallbackManager no-chain sessions', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     await mgr.handleEvent({
@@ -4548,9 +4734,14 @@ describe('ForegroundFallbackManager no-chain sessions', () => {
 
   test('councillor session.error: no abort and no re-prompt', async () => {
     const { mocks } = createMockClient();
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'message.updated',
@@ -4582,7 +4773,7 @@ describe('ForegroundFallbackManager no-chain sessions', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
     mgr.disableChain('orchestrator');
 
@@ -4622,9 +4813,14 @@ describe('ForegroundFallbackManager no-chain sessions', () => {
 describe('ForegroundFallbackManager disableChain', () => {
   test('after disableChain, rate-limit error surfaces instead of falling back', async () => {
     const { mocks } = createMockClient();
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     mgr.disableChain('orchestrator');
 
@@ -4649,9 +4845,14 @@ describe('ForegroundFallbackManager disableChain', () => {
 
   test('other agents chains are unaffected by disableChain', async () => {
     const { mocks } = createMockClient();
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+      } as any,
+      0,
+    );
 
     mgr.disableChain('orchestrator');
 
@@ -4694,7 +4895,7 @@ describe('ForegroundFallbackManager dispose', () => {
       { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
       true,
       { directory: '/test' } as any,
-      3, // maxRetries
+      0, // maxRetries — first error exhausts the budget
       undefined, // coordinator
       undefined, // onSessionModelChanged
       40, // initialRetryDelayMs
@@ -4740,7 +4941,7 @@ describe('ForegroundFallbackManager dispose', () => {
       { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
       true,
       { directory: '/test' } as any,
-      3, // maxRetries
+      0, // maxRetries — first error exhausts the budget
       undefined, // coordinator
       undefined, // onSessionModelChanged
       0, // initialRetryDelayMs — intervene immediately
@@ -4788,7 +4989,7 @@ describe('ForegroundFallbackManager dispose', () => {
         { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
         true,
         { directory: '/test' } as any,
-        3, // maxRetries
+        0, // maxRetries — first error exhausts the budget
         undefined, // coordinator
         undefined, // onSessionModelChanged
         0, // initialRetryDelayMs — intervene immediately
@@ -4834,5 +5035,449 @@ describe('ForegroundFallbackManager dispose', () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Retry budget semantics (issue #955)
+// ---------------------------------------------------------------------------
+
+describe('ForegroundFallbackManager retry budget', () => {
+  const failoverError = { message: 'Rate limit exceeded' };
+
+  function seedModelEvent(sessionID: string, modelID: string) {
+    return {
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          agent: 'orchestrator',
+          providerID: 'openai',
+          modelID,
+          role: 'assistant',
+        },
+      },
+    };
+  }
+
+  function errorEvent(sessionID: string) {
+    return {
+      type: 'session.error',
+      properties: { sessionID, error: failoverError },
+    };
+  }
+
+  function successEvent(sessionID: string, modelID: string) {
+    return {
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          agent: 'orchestrator',
+          providerID: 'openai',
+          modelID,
+          role: 'assistant',
+          time: { created: 1, completed: 2 },
+        },
+      },
+    };
+  }
+
+  function createBudgetManager(maxRetries: number, initialRetryDelayMs = 0) {
+    const { mocks } = createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c', 'openai/gpt-d'] },
+      true,
+      { directory: '/test' } as any,
+      maxRetries,
+      undefined, // coordinator
+      undefined, // onSessionModelChanged
+      initialRetryDelayMs,
+      0, // retryDelayMs — no backoff between triggers in budget tests
+    );
+    return { mocks, mgr };
+  }
+
+  test('maxRetries=1 absorbs the first error and falls back on the second', async () => {
+    const { mocks, mgr } = createBudgetManager(1);
+    const sessionID = 'sess-budget-1';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+
+    // Error 1 of maxRetries=1 → absorbed on the current model via same-model retry.
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+    const call0 = mocks.promptAsync.mock.calls[0] as [
+      { body: { model: { providerID: string; modelID: string } } },
+    ];
+    expect(call0[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-b',
+    });
+
+    // Error 2 (maxRetries+1) → advance the chain to gpt-c.
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+    const call = mocks.promptAsync.mock.calls[1] as [
+      { model: { providerID: string; modelID: string } },
+    ];
+    expect(call[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-c',
+    });
+  });
+
+  test('maxRetries=0 falls back on the first retryable error', async () => {
+    const { mocks, mgr } = createBudgetManager(0);
+    const sessionID = 'sess-budget-0';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    const call = mocks.promptAsync.mock.calls[0] as [
+      { model: { providerID: string; modelID: string } },
+    ];
+    expect(call[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-c',
+    });
+  });
+
+  test('session.status retry path absorbs the first retry with maxRetries=1', async () => {
+    const { mocks, mgr } = createBudgetManager(1);
+    const sessionID = 'sess-budget-status-retry';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+
+    const statusRetry = (attempt: number) => ({
+      type: 'session.status',
+      properties: {
+        sessionID,
+        status: {
+          type: 'retry',
+          attempt,
+          message: 'rate limit, retrying...',
+        },
+      },
+    });
+
+    // Retry event 1 → absorbed but NO-OP for session.status (per spec).
+    await mgr.handleEvent(statusRetry(1));
+    expect(mocks.abort).not.toHaveBeenCalled();
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+
+    // Retry event 2 exhausts the budget → advance to gpt-c via fallback path.
+    await mgr.handleEvent(statusRetry(2));
+    expect(mocks.abort).toHaveBeenCalledTimes(1); // fallback path DOES abort
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    const call = mocks.promptAsync.mock.calls[0] as [
+      { model: { providerID: string; modelID: string } },
+    ];
+    expect(call[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-c',
+    });
+  });
+
+  test('budget accumulates across the whole chain and stays spent', async () => {
+    const { mocks, mgr } = createBudgetManager(2);
+    const sessionID = 'sess-budget-chain';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+
+    const realNowFn = Date.now;
+    let fakeNow = realNowFn();
+    Date.now = () => fakeNow;
+    try {
+      const fail = async () => {
+        fakeNow += 6_000; // keep every trigger outside the dedup window
+        await mgr.handleEvent(errorEvent(sessionID));
+      };
+
+      // Errors 1 and 2 are absorbed as same-model retries (gpt-b): promptAsync called twice.
+      await fail();
+      await fail();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+      // Both retries use the same model gpt-b.
+      expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+        providerID: 'openai',
+        modelID: 'gpt-b',
+      });
+      expect(mocks.promptAsync.mock.calls[1]?.[0].body.model).toEqual({
+        providerID: 'openai',
+        modelID: 'gpt-b',
+      });
+
+      // Error 3 advances gpt-b → gpt-c.
+      await fail();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(3);
+      const call2 = mocks.promptAsync.mock.calls[2] as [
+        { model: { providerID: string; modelID: string } },
+      ];
+      expect(call2[0].body.model).toEqual({
+        providerID: 'openai',
+        modelID: 'gpt-c',
+      });
+      // The spent budget is NOT reset by the model switch.
+      expect((mgr as any).sessionRetries.get(sessionID)).toBe(2);
+
+      // Error 4: still exhausted, advance to gpt-d.
+      await fail();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(4);
+      const third = mocks.promptAsync.mock.calls[3] as [
+        { model: { providerID: string; modelID: string } },
+      ];
+      expect(third[0].body.model).toEqual({
+        providerID: 'openai',
+        modelID: 'gpt-d',
+      });
+
+      // Error 5: first exhaustion → sticky re-prompt on gpt-d (promptAsync 5× total).
+      await fail();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(5);
+
+      // Error 6: second exhaustion → abort once, no more re-prompts.
+      await fail();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(5);
+      expect(mocks.abort).toHaveBeenCalledTimes(1);
+    } finally {
+      Date.now = realNowFn;
+    }
+  });
+
+  test('a completed successful assistant response refills the budget', async () => {
+    const { mocks, mgr } = createBudgetManager(1);
+    const sessionID = 'sess-budget-success';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+
+    // Exhaust the budget: error absorbed (same-model retry), second would trigger…
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-b',
+    });
+
+    // …but a completed successful response clears the count first.
+    await mgr.handleEvent(successEvent(sessionID, 'gpt-b'));
+    expect((mgr as any).sessionRetries.get(sessionID)).toBeUndefined();
+
+    // The next failure sequence starts absorbed again (maxRetries=1).
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+    expect(mocks.promptAsync.mock.calls[1]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-b',
+    });
+
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(3);
+    expect(mocks.promptAsync.mock.calls[2]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-c',
+    });
+  });
+
+  test('initialRetryDelayMs delays the first trigger once the budget is exhausted', async () => {
+    const { mocks, mgr } = createBudgetManager(1, 40);
+    const sessionID = 'sess-budget-delay';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+
+    // Error 1 is absorbed as same-model retry: delay must not start before exhaustion.
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect((mgr as any).pendingInitialDelay.size).toBe(0);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-b',
+    });
+
+    // Error 2 exhausts the budget → schedules the delayed trigger.
+    await mgr.handleEvent(errorEvent(sessionID));
+    // Delayed trigger fires immediately after scheduling (not called yet).
+    expect((mgr as any).pendingInitialDelay.size).toBe(1);
+
+    // Errors arriving while the delayed trigger is pending must not jump
+    // the queue or re-anchor the timer.
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect((mgr as any).pendingInitialDelay.size).toBe(1);
+
+    // The delayed trigger fires and advances the chain.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+    const call = mocks.promptAsync.mock.calls[1] as [
+      { model: { providerID: string; modelID: string } },
+    ];
+    expect(call[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-c',
+    });
+  });
+
+  // ===========================================================================
+  // Terminal absorb tests (new semantics)
+  // ===========================================================================
+
+  describe('Terminal absorb semantics', () => {
+    test('message.updated error with maxRetries=1 absorbs and replays same model', async () => {
+      const { mocks, mgr } = createBudgetManager(1);
+      const sessionID = 'sess-msg-absorb';
+
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID,
+            agent: 'orchestrator',
+            providerID: 'openai',
+            modelID: 'gpt-b',
+            error: { message: 'Rate limit exceeded' },
+          },
+        },
+      });
+
+      // First error absorbed: replay on same model gpt-b via promptAsync.
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect(mocks.abort).not.toHaveBeenCalled();
+      expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+        providerID: 'openai',
+        modelID: 'gpt-b',
+      });
+      expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+
+      // Second error exhausts budget → next chain model gpt-c.
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID,
+            agent: 'orchestrator',
+            providerID: 'openai',
+            modelID: 'gpt-b',
+            error: { message: 'Rate limit exceeded' },
+          },
+        },
+      });
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+      expect(mocks.promptAsync.mock.calls[1]?.[0].body.model).toEqual({
+        providerID: 'openai',
+        modelID: 'gpt-c',
+      });
+    });
+
+    test('same-model retry does NOT call onSessionModelChanged or showFallbackToast', async () => {
+      const showToast = mock(async () => ({}));
+      const { mocks } = createMockClient();
+      const onModelChanged = mock();
+      const mgr = new ForegroundFallbackManager(
+        makeChains(),
+        true,
+        {
+          directory: '/test',
+          client: { tui: { showToast } },
+        } as any,
+        1,
+        undefined,
+        onModelChanged,
+      );
+
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID: 'sess-no-switch',
+            providerID: 'openai',
+            modelID: 'gpt-b',
+            role: 'assistant',
+          },
+        },
+      });
+
+      await mgr.handleEvent({
+        type: 'session.error',
+        properties: {
+          sessionID: 'sess-no-switch',
+          error: { message: 'Rate limit exceeded' },
+        },
+      });
+
+      // Same-model retry should NOT change sessionModel or call toast.
+      expect(onModelChanged).not.toHaveBeenCalled();
+      expect(showToast).not.toHaveBeenCalled();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      // Replay is on the same model gpt-b.
+      expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+        providerID: 'openai',
+        modelID: 'gpt-b',
+      });
+    });
+
+    test('same-model retry where promptAsync rejects handles boundedly without re-consumption', async () => {
+      createMockClient({
+        promptAsyncImpl: async () => {
+          throw new Error('generic prompt failure');
+        },
+      });
+      const sessionID = 'sess-retry-bound';
+      const manager = new ForegroundFallbackManager(
+        makeChains({ orchestrator: ['openai/gpt-b', 'openai/gpt-c'] }),
+        true,
+        { directory: '/test' } as any,
+        1, // maxRetries=1
+      );
+
+      await manager.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: { sessionID, providerID: 'openai', modelID: 'gpt-b' },
+        },
+      });
+
+      // Terminal absorb: promptAsync throws generic error, handleEvent returns cleanly.
+      const result = await manager.handleEvent(errorEvent(sessionID));
+
+      expect(result).toBeUndefined(); // resolves successfully
+      expect(manager.isFallbackInProgress(sessionID)).toBe(false);
+      // Budget consumed once (absorbed), not re-consumed.
+      expect((manager as any).sessionRetries.get(sessionID)).toBe(1);
+    });
+
+    test('no-chain disabled session: terminal absorb does NOT call promptAsync', async () => {
+      const { mocks } = createMockClient();
+      const mgr = new ForegroundFallbackManager(
+        {}, // No chains configured
+        true,
+        { directory: '/test' } as any,
+        1,
+      );
+
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID: 'sess-no-chain',
+            providerID: 'openai',
+            modelID: 'gpt-b',
+          },
+        },
+      });
+
+      // No chain → no intervention for terminal absorb.
+      await mgr.handleEvent({
+        type: 'session.error',
+        properties: {
+          sessionID: 'sess-no-chain',
+          error: { message: 'Rate limit exceeded' },
+        },
+      });
+
+      expect(mocks.promptAsync).not.toHaveBeenCalled();
+    });
   });
 });

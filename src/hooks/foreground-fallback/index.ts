@@ -357,9 +357,16 @@ export class ForegroundFallbackManager {
    *  when the model has changed, allowing the cascade to continue when a
    *  new fallback model also fails within the dedup window. */
   private readonly lastTriggerModel = new Map<string, string>();
-  /** sessionID -> consecutive 429 count for the current model.
-   *  Reset on model swap or session deletion. */
+  /** sessionID -> accumulated retryable-error count for this session's
+   *  current fallback descent. The budget is shared ACROSS the whole
+   *  fallback chain: it is NOT reset on model swap. Cleared only on a
+   *  completed successful assistant response, session deletion, or a
+   *  fresh user-turn descent (see execFallback's reset branch). */
   private readonly sessionRetries = new Map<string, number>();
+  /** Sessions whose initial-delay fallback trigger has already been
+   *  scheduled (initialRetryDelayMs applies to the first trigger only).
+   *  Cleared alongside sessionRetries. */
+  private readonly initialDelayScheduled = new Set<string>();
   /** sessionID -> pending initial delay timeout handle.
    *  Cleared on recovery or session deletion. */
   private readonly pendingInitialDelay = new Map<
@@ -514,7 +521,8 @@ export class ForegroundFallbackManager {
     private chains: Record<string, string[]>,
     private readonly enabled: boolean,
     private readonly input: PluginInput,
-    /** Consecutive 429s tolerated on the same model before swap/abort. */
+    /** Retryable errors absorbed (errors 1..maxRetries) before the fallback
+     *  chain advances; the budget accumulates across the whole chain. */
     private readonly maxRetries: number = 3,
     coordinator?: SessionLifecycle,
     onSessionModelChanged?: (sessionID: string, model: string) => void,
@@ -571,6 +579,7 @@ export class ForegroundFallbackManager {
         this.lastTrigger.delete(id);
         this.lastTriggerModel.delete(id);
         this.sessionRetries.delete(id);
+        this.initialDelayScheduled.delete(id);
         this.chainExhaustion.delete(id);
         this.lastFallbackTime.delete(id);
         // Cancel any pending initial delay
@@ -624,12 +633,17 @@ export class ForegroundFallbackManager {
           typeof messageTime.completed === 'number';
         // Failover-worthy error on an individual message
         if (info.error && isFailoverError(info.error)) {
-          if (this.shouldTriggerFallback(sessionID)) {
+          const d = this.decideIntervention(sessionID, false);
+          if (d === 'absorb') {
+            await this.retryCurrentModel(sessionID, info.error);
+          } else if (d === 'fallback') {
             await this.tryFallback(sessionID, info.error);
           }
+          // fallback-delayed → nothing
         } else if (isCompletedSuccessfulAssistant) {
           // Only a completed, successful assistant response proves recovery.
           this.sessionRetries.delete(sessionID);
+          this.initialDelayScheduled.delete(sessionID);
           this.chainExhaustion.delete(sessionID);
           this.lastFallbackTime.delete(sessionID);
           // A success also ends any failure streak, so the models the
@@ -657,13 +671,15 @@ export class ForegroundFallbackManager {
           | undefined;
         if (!props) break;
         const sessionID = eventSessionID(props);
-        if (
-          sessionID &&
-          props.error &&
-          isFailoverError(props.error) &&
-          this.shouldTriggerFallback(sessionID)
-        ) {
-          await this.tryFallback(sessionID, props.error);
+        if (sessionID && props.error && isFailoverError(props.error)) {
+          const d = this.decideIntervention(sessionID, false);
+          if (d === 'absorb') {
+            await this.retryCurrentModel(sessionID, props.error);
+          } else if (d === 'fallback') {
+            // Dedup stays inside tryFallback.
+            await this.tryFallback(sessionID, props.error);
+          }
+          // fallback-delayed → nothing
         }
         break;
       }
@@ -710,7 +726,8 @@ export class ForegroundFallbackManager {
           }
           // Otherwise (attempt === 1, or model didn't change, or outside
           // dedup window): process as genuine retry for current model.
-          if (this.shouldTriggerFallback(sessionID, true)) {
+          const d = this.decideIntervention(sessionID, true);
+          if (d === 'fallback') {
             // Failover may have been detected from status.message (e.g.
             // 'AI_APICallError: Gone') with no separate error property;
             // forward that message so 401/410 inline errors suppress the
@@ -720,16 +737,17 @@ export class ForegroundFallbackManager {
               props.error ?? { message: props.status?.message ?? '' },
             );
           }
+          // absorb/fallback-delayed → no-op
           break;
         }
 
         // Note: do NOT clear sessionRetries here on non-rate-limit statuses.
         // Abort events triggered by our own fallback carry non-rate-limit
         // messages and would reset the counter, creating an infinite loop:
-        // abort → fallback → set retries to 1 → abort event clears retries
-        // → next retry sees tried=0 → abort+fallback again → repeat.
-        // Retries are only cleared on a completed successful assistant
-        // response or session deletion.
+        // abort → absorbed error → abort event clears retries → the budget
+        // refills → repeat. Retries are only cleared on a completed
+        // successful assistant response, session deletion, or the explicit
+        // fresh-descent reset inside execFallback.
         break;
       }
 
@@ -871,44 +889,54 @@ export class ForegroundFallbackManager {
   // Retry budget
   // ---------------------------------------------------------------------------
 
-  /** Increment retry counter and return true when the budget is exhausted.
-   *  Used by shouldIntervene when tried > 0 — each retry counts toward the
-   *  budget and only triggers fallback after maxRetries - 1 absorptions.
-   *  First failover retry (tried === 0) bypasses the counter via shouldIntervene. */
+  /** Increment the accumulated retry count and return true once the budget
+   *  is spent. Semantics of maxRetries: errors 1..maxRetries are absorbed on
+   *  the current model; error maxRetries+1 — and every error after it —
+   *  triggers the fallback. On exhaustion the count is deliberately NOT
+   *  cleared: the budget stays spent so subsequent errors keep triggering
+   *  the chain descent instead of re-absorbing on each new model. */
   private consumeRetryBudget(sessionID: string): boolean {
     const tried = this.sessionRetries.get(sessionID) ?? 0;
-    if (tried < this.maxRetries - 1) {
+    if (tried < this.maxRetries) {
       this.sessionRetries.set(sessionID, tried + 1);
-      log('[foreground-fallback] rate-limit retry', {
+      log('[foreground-fallback] retry budget', {
         sessionID,
-        attempt: tried + 1,
-        remaining: this.maxRetries - tried - 1,
+        tried: tried + 1,
+        maxRetries: this.maxRetries,
+        verdict: 'absorbed',
       });
       return false;
     }
-    this.sessionRetries.delete(sessionID);
+    log('[foreground-fallback] retry budget', {
+      sessionID,
+      tried,
+      maxRetries: this.maxRetries,
+      verdict: 'fallback-triggered',
+    });
     return true;
   }
 
-  /** Intervene immediately on first occurrence (tried === 0), otherwise
-   *  delegate to retry budget. Used by all three event paths. */
-  private shouldTriggerFallback(
+  /** Intervention decision types for retry budget semantics. */
+  private decideIntervention(
     sessionID: string,
     needsAbort = false,
-  ): boolean {
-    const tried = this.sessionRetries.get(sessionID) ?? 0;
-    if (tried === 0) {
-      if (this.initialRetryDelayMs > 0) {
-        // Don't set sessionRetries here - it would let subsequent errors
-        // consume the retry budget before the delay elapses.
+  ): 'absorb' | 'fallback' | 'fallback-delayed' {
+    if (!this.consumeRetryBudget(sessionID)) {
+      return 'absorb';
+    }
+    if (this.initialRetryDelayMs > 0) {
+      if (this.pendingInitialDelay.has(sessionID)) {
+        // A delayed trigger is already pending and will fire soon;
+        // errors arriving meanwhile must not jump the queue.
+        return 'fallback-delayed';
+      }
+      if (!this.initialDelayScheduled.has(sessionID)) {
+        this.initialDelayScheduled.add(sessionID);
         log('[foreground-fallback] delaying initial fallback', {
           sessionID,
           delayMs: this.initialRetryDelayMs,
           needsAbort,
         });
-        // Cancel any existing pending delay for this session
-        const existing = this.pendingInitialDelay.get(sessionID);
-        if (existing) clearTimeout(existing);
         const handle = setTimeout(() => {
           this.pendingInitialDelay.delete(sessionID);
           // Background fallback is fail-soft: a failure must be logged
@@ -925,11 +953,10 @@ export class ForegroundFallbackManager {
           });
         }, this.initialRetryDelayMs);
         this.pendingInitialDelay.set(sessionID, handle);
-        return false;
+        return 'fallback-delayed';
       }
-      return true;
     }
-    return this.consumeRetryBudget(sessionID);
+    return 'fallback';
   }
 
   // ---------------------------------------------------------------------------
@@ -1160,6 +1187,8 @@ export class ForegroundFallbackManager {
       // cannot clear chainExhaustion and fallback would stay disabled for
       // the rest of the session. A fresh descent earns a fresh chance.
       this.chainExhaustion.delete(sessionID);
+      this.sessionRetries.delete(sessionID);
+      this.initialDelayScheduled.delete(sessionID);
     }
 
     // After the chain has been exhausted twice (reset retry failed and we
@@ -1219,8 +1248,7 @@ export class ForegroundFallbackManager {
       }
     }
     tried.add(nextModel);
-    // Reset retry count on model switch - the new model starts fresh.
-    this.sessionRetries.delete(sessionID);
+    // Retry budget is shared across the entire fallback chain.
     this.lastFallbackTime.delete(sessionID);
     // Cancel any pending initial delay on model switch
     const pendingDelay = this.pendingInitialDelay.get(sessionID);
@@ -1248,7 +1276,6 @@ export class ForegroundFallbackManager {
     // points in the tryFallback* callers; a disposed generation must not
     // even read the transcript through the old client.
     if (this.abandonedByDispose(sessionID)) return;
-    const session = getClient(this.input).session;
     try {
       const selection = this.selectFallbackModel(sessionID);
       if (!selection) return;
@@ -1259,266 +1286,16 @@ export class ForegroundFallbackManager {
         await abortSessionWithTimeout(getClient(this.input), sessionID);
         return;
       }
-      const { agentName, currentModel, nextModel, ref } = selection;
+      const { currentModel, nextModel } = selection;
 
-      // Retrieve the last user message to re-submit with the fallback model.
-      // Fence captured BEFORE any await in the preparation: a board
-      // relaunch during the transcript read or the admission await must
-      // not enroll the new generation under this (stale) attempt's
-      // baseline. undefined = not a tracked background child
-      // (foreground/untracked) → the handoff is a no-op, never a
-      // wildcard.
-      const preparedGeneration = this.readBackgroundGeneration?.(sessionID);
-
-      // Read only the transcript tail: the replay needs the last replayable
-      // user message and the trailing message id (handoff baseline), not the
-      // whole history. Long-lived sessions serve the full listing in the
-      // hundreds of megabytes (measured 463 MB / 11.7 s on a live
-      // months-old orchestrator session), which delayed every failover by
-      // ~20 s. The `limit` query keeps the hot path O(tail); the full read
-      // remains as a fallback for hosts that ignore it or transcripts whose
-      // tail carries no replayable user message.
-      const tailResult = await session.messages({
-        path: { id: sessionID },
-        query: { limit: FALLBACK_REPLAY_TAIL_MESSAGES },
-      });
-      // Transcript read suspended across a dispose(): everything from
-      // here on — handoff arming, replay prompt, switch claim — would
-      // run through the destroyed generation's client. Abandon before
-      // arming anything; the tryFallback* finally releases inProgress.
-      if (this.abandonedByDispose(sessionID)) return;
-      // result.data may contain partial/streaming messages whose `info` is
-      // undefined at runtime (OpenCode violates its own declared type), and
-      // v2 messages carry `type`/`text` instead of `info`/`parts`, so guard
-      // each entry instead of dereferencing a fixed shape.
-      let messages = (tailResult.data ?? []) as unknown[];
-      let requestError: unknown = tailResult.error ?? undefined;
-      if (!messages.some((message) => isReplayableUserMessage(message))) {
-        const fullResult = await session.messages({
-          path: { id: sessionID },
-        });
-        if (this.abandonedByDispose(sessionID)) return;
-        messages = (fullResult.data ?? []) as unknown[];
-        // Preserve BOTH failures: when the tail and the full read fail
-        // differently, the diagnostic log must surface the first error
-        // too instead of letting the full-read error overwrite it.
-        const fullError = fullResult.error ?? undefined;
-        if (fullError !== undefined) {
-          requestError =
-            requestError === undefined ? fullError : [requestError, fullError];
-        }
-      }
-      const lastUser = [...messages].reverse().find(isReplayableUserMessage);
-      if (!lastUser) {
-        log('[foreground-fallback] no user message found', {
-          sessionID,
-          messageCount: messages.length,
-          requestError,
-        });
-        return;
-      }
-
-      // promptAsync queues the prompt and returns immediately - this avoids
-      // blocking the event handler while waiting for a full LLM response.
-      const sessionClient = session;
-      if (typeof sessionClient.promptAsync !== 'function') {
-        log('[foreground-fallback] promptAsync unavailable', { sessionID });
-        return;
-      }
-      // Loose alias: the v2 client shim accepts extra top-level args
-      // (`modelSwitch`) the way orchestrator-wake passes `delivery`.
-      // Bound: the SDK's promptAsync reads `this._client`, so calling the
-      // extracted function unbound throws `undefined is not an object
-      // (evaluating 'this._client')` on the real client (same binding the
-      // revived-run tracker already applies).
-      const promptAsync = sessionClient.promptAsync.bind(sessionClient) as (
-        args: Record<string, unknown> & { modelSwitch?: 'required' },
-      ) => Promise<unknown>;
-
-      const replayParts = partsFromReplayMessage(lastUser) as Array<{
-        type: 'text';
-        text: string;
-      }>;
-
-      // v2-only flag (consumed by the client shim): the replay's model is
-      // the fallback TARGET, so a v2 host without session.switchModel must
-      // reject the replay (typed error) instead of silently replaying on
-      // the model that just failed. v1 call bytes stay untouched.
-      const isV2Host =
-        (this.input as PluginInput & { hostFlavor?: string }).hostFlavor ===
-        'v2';
-      const promptBody = {
-        path: { id: sessionID },
-        body: {
-          parts: [
-            ...replayParts,
-            createInternalAgentTextPart(
-              "<system-reminder>\nThe previous model request failed and is being retried with a fallback model. Continue processing the user's original request above. Do not respond to this reminder.\n</system-reminder>",
-            ),
-          ],
-          model: ref,
-          ...(agentName ? { agent: agentName } : {}),
-        },
-        ...(isV2Host ? { modelSwitch: 'required' as const } : {}),
-      };
-
-      let promptResult: unknown;
-      // Arm the observation handoff BEFORE the admission await: while
-      // promptAsync is pending the stop gate defers terminal
-      // publication — the re-prompted result may already be persisted
-      // but has no delivery owner yet. Baseline = trailing message WITH
-      // a string id from the transcript read that produced the replay,
-      // so the substituted run's answer is always post-baseline.
-      const baselineMessageID = [...messages]
-        .reverse()
-        .find(
-          (m) =>
-            isRecord(m) &&
-            typeof (m as { info?: { id?: unknown } }).info?.id === 'string',
-        ) as { info: { id: string } } | undefined;
-      const handoffArmed =
-        this.backgroundFallbackHandoff?.prepare(
-          sessionID,
-          preparedGeneration,
-          baselineMessageID?.info?.id,
-        ) ?? false;
-      // Distinguish "not applicable" (foreground or unmanaged session —
-      // preparedGeneration undefined, the fallback proceeds) from "was
-      // a confirmed background child whose preparation lost validity"
-      // (generation changed during the transcript read): the replay
-      // prompt and baseline are stale for an execution that no longer
-      // exists — do NOT send them.
-      if (preparedGeneration !== undefined && !handoffArmed) {
-        log(
-          '[foreground-fallback] background child superseded during preparation; replay aborted',
-          { sessionID, preparedGeneration },
-        );
-        return;
-      }
-      const withdrawHandoff = (): void => {
-        if (handoffArmed) {
-          this.backgroundFallbackHandoff?.reject(sessionID, preparedGeneration);
-        }
-      };
-      const settleUnresolvedHandoff = (): void => {
-        if (handoffArmed) {
-          this.backgroundFallbackHandoff?.settleUnresolved(
-            sessionID,
-            preparedGeneration,
-          );
-        }
-      };
-      try {
-        promptResult = await promptAsync(promptBody);
-      } catch (promptErr) {
-        if (isV2Host) {
-          // v2 steer delivery does not reject with BusyError: any rejected
-          // replay is final, not a signal to retry. An abort cannot make
-          // the admission succeed and may kill a promoted background job.
-          // Preserve the cause rather than misreporting it as busy.
-          withdrawHandoff();
-          throw promptErr;
-        }
-        if (this.withholdsAbortForLiveChildren(sessionID)) {
-          // Explicit busy refusal with no abort attempted: nothing was
-          // admitted, so release ownership (reject) like the v2 branch
-          // above instead of converting into a tracked run.
-          withdrawHandoff();
-          throw promptErr;
-        }
-        log('[foreground-fallback] promptAsync on busy session, aborting', {
-          sessionID,
-          error: stringifyError(promptErr),
-        });
-        await this.promoteForegroundWaiter(sessionID);
-        // Same stale-generation fence as the failover abort above.
-        if (this.abandonedByDispose(sessionID)) return;
-        if (this.withholdsAbortForLiveChildren(sessionID)) {
-          // Explicit busy refusal with no abort attempted: nothing was
-          // admitted, so release ownership (reject) like the v2 branch
-          // above instead of converting into a tracked run.
-          withdrawHandoff();
-          throw promptErr;
-        }
-        try {
-          await abortSessionWithTimeout(getClient(this.input), sessionID);
-        } catch (abortErr) {
-          // Unknown outcome: the abort transport failed — the admission
-          // state cannot be proven either way, so the prepared ownership
-          // CONVERTS into a tracked run instead of being dropped.
-          settleUnresolvedHandoff();
-          throw abortErr;
-        }
-        await new Promise((r) => setTimeout(r, REPROMPT_DELAY_MS));
-        // The abort/re-prompt-delay suspended across a dispose(): the
-        // second replay must not go through the old client. The first
-        // prompt's transport failed with an unknown outcome, so convert
-        // (never drop) the armed handoff exactly like the retry-failure
-        // path below.
-        if (this.abandonedByDispose(sessionID)) {
-          settleUnresolvedHandoff();
-          return;
-        }
-        try {
-          promptResult = await promptAsync(promptBody);
-        } catch (retryErr) {
-          // Transport failed without a response: the host may still
-          // have accepted the replay — convert, never drop.
-          settleUnresolvedHandoff();
-          throw retryErr;
-        }
-      }
-
-      // SDK envelopes can resolve (not reject) with `{ error }` — an
-      // unresolved admission must not be treated as an accepted switch:
-      // state migration and observation transfer only happen after the
-      // same error-envelope contract the other SDK call sites apply.
-      if (isRecord(promptResult) && responseError(promptResult) !== undefined) {
-        log(
-          '[foreground-fallback] fallback re-prompt rejected by host error envelope',
-          {
-            sessionID,
-            agentName,
-            intended: nextModel,
-          },
-        );
-        withdrawHandoff();
-        return;
-      }
-
-      // v2 shim: `switched: false` means the replay WAS DELIVERED on
-      // the current model — the work is admitted, so the observation
-      // handoff is kept (delivery needs an owner); only the model-switch
-      // CLAIM is suppressed (sessionModel feeds chain descent and
-      // onSessionModelChanged migrates provider accounting; both would
-      // lie). Prompt admission and switch confirmation are two
-      // different facts.
-      const deliveredWithoutSwitch =
-        isRecord(promptResult) && promptResult.switched === false;
-      if (deliveredWithoutSwitch) {
-        log(
-          '[foreground-fallback] fallback prompt delivered on the current model (model switch failed)',
-          { sessionID, agentName, from: currentModel, intended: nextModel },
-        );
-      } else {
-        this.sessionModel.set(sessionID, nextModel);
-        this.onSessionModelChanged?.(sessionID, nextModel);
-      }
-      // Admission accepted (with or without the switch): convert the
-      // prepared handoff into a tracked run (register + immediate
-      // probe) so the substituted run's result is observed and
-      // delivered to the parent.
-      if (handoffArmed) {
-        this.backgroundFallbackHandoff?.admit(sessionID, preparedGeneration);
-      }
-      if (deliveredWithoutSwitch) return;
-      log('[foreground-fallback] switched to fallback model', {
+      // Execute the extracted replay logic for model-switch fallback.
+      await this.replayFallbackPrompt(
         sessionID,
-        agentName,
-        from: currentModel,
-        to: nextModel,
-      });
-      this.showFallbackToast(agentName, nextModel, error);
+        nextModel,
+        currentModel,
+        true,
+        error,
+      );
     } catch (err) {
       log('[foreground-fallback] fallback attempt failed', {
         sessionID,
@@ -1551,6 +1328,346 @@ export class ForegroundFallbackManager {
         },
       })
       .catch(() => {});
+  }
+
+  /**
+   * Replay a user prompt via promptAsync with model switch support and
+   * background-handoff transfer. This is the extracted core from execFallback:
+   * tail read + full fallback + preserved dual errors, last-user lookup,
+   * promptAsync binding, promptBody, background handoff prepare/withdraw/settle/
+   * admit, the prompt+busy-abort loop, envelope handling, deliveredWithoutSwitch,
+   * switch claim, and toast. Parameterized by reminder text and switch claim.
+   */
+  private async replayFallbackPrompt(
+    sessionID: string,
+    targetModel: string,
+    fromModel: string | undefined,
+    isModelSwitch: boolean,
+    error?: unknown,
+  ): Promise<void> {
+    const session = getClient(this.input).session;
+    const agentName = this.sessionAgent.get(sessionID);
+    const chain = this.resolveChain(agentName, targetModel);
+    if (!chain.length) return;
+
+    // Fence captured BEFORE any await in the preparation: a board
+    // relaunch during the transcript read or the admission await must
+    // not enroll the new generation under this (stale) attempt's
+    // baseline. undefined = not a tracked background child
+    // (foreground/untracked) → the handoff is a no-op, never a
+    // wildcard.
+    const preparedGeneration = this.readBackgroundGeneration?.(sessionID);
+
+    // Read only the transcript tail: the replay needs the last replayable
+    // user message and the trailing message id (handoff baseline), not the
+    // whole history. Long-lived sessions serve the full listing in the
+    // hundreds of megabytes (measured 463 MB / 11.7 s on a live
+    // months-old orchestrator session), which delayed every failover by
+    // ~20 s. The `limit` query keeps the hot path O(tail); the full read
+    // remains as a fallback for hosts that ignore it or transcripts whose
+    // tail carries no replayable user message.
+    const tailResult = await session.messages({
+      path: { id: sessionID },
+      query: { limit: FALLBACK_REPLAY_TAIL_MESSAGES },
+    });
+    // Transcript read suspended across a dispose(): everything from
+    // here on — handoff arming, replay prompt, switch claim — would
+    // run through the destroyed generation's client. Abandon before
+    // arming anything; the tryFallback* finally releases inProgress.
+    if (this.abandonedByDispose(sessionID)) return;
+    // result.data may contain partial/streaming messages whose `info` is
+    // undefined at runtime (OpenCode violates its own declared type), and
+    // v2 messages carry `type`/`text` instead of `info`/`parts`, so guard
+    // each entry instead of dereferencing a fixed shape.
+    let messages = (tailResult.data ?? []) as unknown[];
+    let requestError: unknown = tailResult.error ?? undefined;
+    if (!messages.some((message) => isReplayableUserMessage(message))) {
+      const fullResult = await session.messages({
+        path: { id: sessionID },
+      });
+      if (this.abandonedByDispose(sessionID)) return;
+      messages = (fullResult.data ?? []) as unknown[];
+      // Preserve BOTH failures: when the tail and the full read fail
+      // differently, the diagnostic log must surface the first error
+      // too instead of letting the full-read error overwrite it.
+      const fullError = fullResult.error ?? undefined;
+      if (fullError !== undefined) {
+        requestError =
+          requestError === undefined ? fullError : [requestError, fullError];
+      }
+    }
+    const lastUser = [...messages].reverse().find(isReplayableUserMessage);
+    if (!lastUser) {
+      log('[foreground-fallback] no user message found', {
+        sessionID,
+        messageCount: messages.length,
+        requestError,
+      });
+      return;
+    }
+
+    // promptAsync queues the prompt and returns immediately - this avoids
+    // blocking the event handler while waiting for a full LLM response.
+    const sessionClient = session;
+    if (typeof sessionClient.promptAsync !== 'function') {
+      log('[foreground-fallback] promptAsync unavailable', { sessionID });
+      return;
+    }
+    // Loose alias: the v2 client shim accepts extra top-level args
+    // (`modelSwitch`) the way orchestrator-wake passes `delivery`.
+    // Bound: the SDK's promptAsync reads `this._client`, so calling the
+    // extracted function unbound throws `undefined is not an object
+    // (evaluating 'this._client')` on the real client (same binding the
+    // revived-run tracker already applies).
+    const promptAsync = sessionClient.promptAsync.bind(sessionClient) as (
+      args: Record<string, unknown> & { modelSwitch?: 'required' },
+    ) => Promise<unknown>;
+
+    const replayParts = partsFromReplayMessage(lastUser) as Array<{
+      type: 'text';
+      text: string;
+    }>;
+
+    // v2-only flag (consumed by the client shim): the replay's model is
+    // the fallback TARGET, so a v2 host without session.switchModel must
+    // reject the replay (typed error) instead of silently replaying on
+    // the model that just failed. v1 call bytes stay untouched.
+    const isV2Host =
+      (this.input as PluginInput & { hostFlavor?: string }).hostFlavor === 'v2';
+
+    // Reminder text parameterization: isModelSwitch keeps the existing wording;
+    // same-model retry uses a system-reminder noting the retry with same model.
+    const reminderText = isModelSwitch
+      ? "<system-reminder>\nThe previous model request failed and is being retried with a fallback model. Continue processing the user's original request above. Do not respond to this reminder.\n</system-reminder>"
+      : "<system-reminder>\nThe previous model request failed and is being retried with the same model. Continue processing the user's original request above. Do not respond to this reminder.\n</system-reminder>";
+
+    const ref = parseModelReference(targetModel);
+    if (!ref) {
+      log('[foreground-fallback] invalid model format', {
+        sessionID,
+        targetModel,
+      });
+      return;
+    }
+
+    const promptBody = {
+      path: { id: sessionID },
+      body: {
+        parts: [...replayParts, createInternalAgentTextPart(reminderText)],
+        model: ref,
+        ...(agentName ? { agent: agentName } : {}),
+      },
+      ...(isV2Host && isModelSwitch
+        ? { modelSwitch: 'required' as const }
+        : {}),
+    };
+
+    // Arm the observation handoff BEFORE the admission await: while
+    // promptAsync is pending the stop gate defers terminal
+    // publication — the re-prompted result may already be persisted
+    // but has no delivery owner yet. Baseline = trailing message WITH
+    // a string id from the transcript read that produced the replay,
+    // so the substituted run's answer is always post-baseline.
+    const baselineMessageID = [...messages]
+      .reverse()
+      .find(
+        (m) =>
+          isRecord(m) &&
+          typeof (m as { info?: { id?: unknown } }).info?.id === 'string',
+      ) as { info: { id: string } } | undefined;
+    const handoffArmed =
+      this.backgroundFallbackHandoff?.prepare(
+        sessionID,
+        preparedGeneration,
+        baselineMessageID?.info?.id,
+      ) ?? false;
+    // Distinguish "not applicable" (foreground or unmanaged session —
+    // preparedGeneration undefined, the fallback proceeds) from "was
+    // a confirmed background child whose preparation lost validity"
+    // (generation changed during the transcript read): the replay
+    // prompt and baseline are stale for an execution that no longer
+    // exists — do NOT send them.
+    if (preparedGeneration !== undefined && !handoffArmed) {
+      log(
+        '[foreground-fallback] background child superseded during preparation; replay aborted',
+        { sessionID, preparedGeneration },
+      );
+      return;
+    }
+    const withdrawHandoff = (): void => {
+      if (handoffArmed) {
+        this.backgroundFallbackHandoff?.reject(sessionID, preparedGeneration);
+      }
+    };
+    const settleUnresolvedHandoff = (): void => {
+      if (handoffArmed) {
+        this.backgroundFallbackHandoff?.settleUnresolved(
+          sessionID,
+          preparedGeneration,
+        );
+      }
+    };
+    let promptResult: unknown;
+    try {
+      promptResult = await promptAsync(promptBody);
+    } catch (promptErr) {
+    if (isV2Host) {
+        // v2 steer delivery does not reject with BusyError: any rejected
+        // replay is final, not a signal to retry. An abort cannot make
+        // the admission succeed and may kill a promoted background job.
+        // Preserve the cause rather than misreporting it as busy.
+        withdrawHandoff();
+        throw promptErr;
+      }
+      if (this.withholdsAbortForLiveChildren(sessionID)) {
+        // Explicit busy refusal with no abort attempted: nothing was
+        // admitted, so release ownership (reject) like the v2 branch
+        // above instead of converting into a tracked run.
+        withdrawHandoff();
+        throw promptErr;
+      }
+      log('[foreground-fallback] promptAsync on busy session, aborting', {
+        sessionID,
+        error: stringifyError(promptErr),
+      });
+      await this.promoteForegroundWaiter(sessionID);
+      // Same stale-generation fence as the failover abort above.
+      if (this.abandonedByDispose(sessionID)) return;
+      if (this.withholdsAbortForLiveChildren(sessionID)) {
+        // Explicit busy refusal with no abort attempted: nothing was
+        // admitted, so release ownership (reject) like the v2 branch
+        // above instead of converting into a tracked run.
+        withdrawHandoff();
+        throw promptErr;
+      }
+      try {
+        await abortSessionWithTimeout(getClient(this.input), sessionID);
+      } catch (abortErr) {
+        // Unknown outcome: the abort transport failed — the admission
+        // state cannot be proven either way, so the prepared ownership
+        // CONVERTS into a tracked run instead of being dropped.
+        settleUnresolvedHandoff();
+        throw abortErr;
+      }
+      await new Promise((r) => setTimeout(r, REPROMPT_DELAY_MS));
+      // The abort/re-prompt-delay suspended across a dispose(): the
+      // second replay must not go through the old client. The first
+      // prompt's transport failed with an unknown outcome, so convert
+      // (never drop) the armed handoff exactly like the retry-failure
+      // path below.
+      if (this.abandonedByDispose(sessionID)) {
+        settleUnresolvedHandoff();
+        return;
+      }
+      try {
+        promptResult = await promptAsync(promptBody);
+      } catch (retryErr) {
+        // Transport failed without a response: the host may still
+        // have accepted the replay — convert, never drop.
+        settleUnresolvedHandoff();
+        throw retryErr;
+      }
+    }
+
+    // SDK envelopes can resolve (not reject) with `{ error }` — an
+    // unresolved admission must not be treated as an accepted switch:
+    // state migration and observation transfer only happen after the
+    // same error-envelope contract the other SDK call sites apply.
+    if (isRecord(promptResult) && responseError(promptResult) !== undefined) {
+      log(
+        '[foreground-fallback] fallback re-prompt rejected by host error envelope',
+        {
+          sessionID,
+          agentName,
+          intended: targetModel,
+        },
+      );
+      withdrawHandoff();
+      return;
+    }
+
+    // v2 shim: `switched: false` means the replay WAS DELIVERED on
+    // the current model — the work is admitted, so the observation
+    // handoff is kept (delivery needs an owner); only the model-switch
+    // CLAIM is suppressed (sessionModel feeds chain descent and
+    // onSessionModelChanged migrates provider accounting; both would
+    // lie). Prompt admission and switch confirmation are two
+    // different facts.
+    const deliveredWithoutSwitch =
+      isRecord(promptResult) && promptResult.switched === false;
+    if (deliveredWithoutSwitch) {
+      log(
+        '[foreground-fallback] fallback prompt delivered on the current model (model switch failed)',
+        { sessionID, agentName, from: fromModel, intended: targetModel },
+      );
+    } else if (isModelSwitch) {
+      this.sessionModel.set(sessionID, targetModel);
+      this.onSessionModelChanged?.(sessionID, targetModel);
+    }
+    // Admission accepted (with or without the switch): convert the
+    // prepared handoff into a tracked run (register + immediate probe)
+    // so the substituted run's result is observed and delivered to the
+    // parent. Same-model retries are admissions too, and each admitted
+    // prompt must be transferred exactly once.
+    if (handoffArmed) {
+      this.backgroundFallbackHandoff?.admit(sessionID, preparedGeneration);
+    }
+    if (isModelSwitch && !deliveredWithoutSwitch) {
+      log('[foreground-fallback] switched to fallback model', {
+        sessionID,
+        agentName,
+        from: fromModel,
+        to: targetModel,
+      });
+      this.showFallbackToast(agentName, targetModel, error);
+    }
+  }
+
+  /**
+   * Retry the current model on terminal absorb: replay the last user message
+   * on the SAME model (no switch claim, no toast). Used by decideIntervention's
+   * 'absorb' branch for message.updated and session.error. Budget-exhausted
+   * retries consume one absorbed budget slot and replay via promptAsync.
+   * Failures are logged, bounded, and do not affect subsequent budget state.
+   */
+  private async retryCurrentModel(
+    sessionID: string,
+    error?: unknown,
+  ): Promise<void> {
+    if (!sessionID) return;
+    // Fences/guards identical to tryFallback.
+    if (this.abandonedByDispose(sessionID)) return;
+    if (this.inProgress.has(sessionID)) return;
+    if (!this.hasFallbackChain(sessionID)) return;
+
+    this.inProgress.add(sessionID);
+    try {
+      const agentName = this.sessionAgent.get(sessionID);
+      const chain = this.resolveChain(agentName, undefined);
+      // Resolve target model: from sessionModel first, then chain[0].
+      const targetModel = this.sessionModel.get(sessionID);
+      if (!targetModel && agentName && chain.length > 0) {
+        // Inferred primary when no model observed.
+      }
+      const effectiveTarget = targetModel ?? chain[0] ?? chain[0];
+      if (!effectiveTarget) return;
+      // Same-model retry calls replay with isModelSwitch=false (no switch/toast).
+      await this.replayFallbackPrompt(
+        sessionID,
+        effectiveTarget,
+        effectiveTarget,
+        false,
+        error,
+      );
+    } catch (err) {
+      log('[foreground-fallback] retry prompt failed', {
+        sessionID,
+        targetModel: this.sessionModel.get(sessionID) ?? 'unknown',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      this.inProgress.delete(sessionID);
+    }
   }
 
   // ---------------------------------------------------------------------------
