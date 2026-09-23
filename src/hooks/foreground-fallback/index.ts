@@ -169,15 +169,87 @@ const PROVIDER_OUTAGE_PATTERNS = [
   /\bstatus.?410\b/i,
 ];
 
+/** Accept only plausible HTTP status codes so an arbitrary numeric field
+ *  (token counts, ports, retry numbers) is never mistaken for one. */
+function asHttpStatus(value: unknown): number | undefined {
+  if (
+    typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= 100 &&
+    value <= 599
+  ) {
+    return value;
+  }
+  // Some SDKs surface the code as a numeric string ("429").
+  if (typeof value === 'string' && /^\d{3}$/.test(value)) {
+    const parsed = Number(value);
+    if (parsed >= 100 && parsed <= 599) return parsed;
+  }
+  return undefined;
+}
+
+function nestedField(source: unknown, key: string): unknown {
+  return isRecord(source) ? source[key] : undefined;
+}
+
+interface StatusCodeProbe {
+  selected: number | undefined;
+  candidates: Array<{ path: string; value: unknown }>;
+}
+
+/**
+ * Locate a numeric HTTP status code across the provider/SDK/event shapes we
+ * have seen, in priority order:
+ *   statusCode → data.statusCode → cause.statusCode → status →
+ *   response.status → response.statusCode → data.status →
+ *   data.response.status → cause.status → cause.response.status
+ * Only finite HTTP codes are accepted; everything else is ignored.
+ */
+function probeStatusCode(error: {
+  statusCode?: unknown;
+  status?: unknown;
+  data?: unknown;
+  cause?: unknown;
+  response?: unknown;
+}): StatusCodeProbe {
+  const { data, cause, response } = error;
+  const candidates: Array<{ path: string; value: unknown }> = [
+    { path: 'statusCode', value: error.statusCode },
+    { path: 'data.statusCode', value: nestedField(data, 'statusCode') },
+    { path: 'cause.statusCode', value: nestedField(cause, 'statusCode') },
+    { path: 'status', value: error.status },
+    { path: 'response.status', value: nestedField(response, 'status') },
+    { path: 'response.statusCode', value: nestedField(response, 'statusCode') },
+    { path: 'data.status', value: nestedField(data, 'status') },
+    {
+      path: 'data.response.status',
+      value: nestedField(nestedField(data, 'response'), 'status'),
+    },
+    { path: 'cause.status', value: nestedField(cause, 'status') },
+    {
+      path: 'cause.response.status',
+      value: nestedField(nestedField(cause, 'response'), 'status'),
+    },
+  ];
+  let selected: number | undefined;
+  for (const candidate of candidates) {
+    const status = asHttpStatus(candidate.value);
+    if (status !== undefined) {
+      selected = status;
+      break;
+    }
+  }
+  return { selected, candidates };
+}
+
 function extractStatusCode(error: {
   statusCode?: unknown;
   status?: unknown;
-  data?: { statusCode?: unknown };
+  data?: unknown;
+  cause?: unknown;
+  response?: unknown;
 }): number | undefined {
-  // v2 hosts surface provider errors flat ({type, message, status});
-  // v1 uses statusCode / data.statusCode (issue #1283).
-  const value = error.statusCode ?? error.data?.statusCode ?? error.status;
-  return typeof value === 'number' ? value : undefined;
+  return probeStatusCode(error).selected;
 }
 
 function eventSessionID(props: {
@@ -224,62 +296,75 @@ export function isFailoverError(error: unknown): boolean {
   if (typeof error !== 'object') return false;
   const err = error as {
     code?: unknown;
-    cause?: { code?: unknown };
+    cause?: { code?: unknown; statusCode?: unknown; status?: unknown };
     message?: string;
-    statusCode?: number;
     type?: unknown;
+    statusCode?: unknown;
+    status?: unknown;
+    response?: { status?: unknown; statusCode?: unknown };
     data?: {
       code?: unknown;
-      statusCode?: number;
+      statusCode?: unknown;
+      status?: unknown;
       message?: string;
       responseBody?: string;
+      response?: { status?: unknown };
     };
   };
-  const statusCode = extractStatusCode(err);
-  if (
+
+  const probe = probeStatusCode(err);
+  const statusCode = probe.selected;
+
+  const statusMatches =
     statusCode === 429 ||
     statusCode === 401 ||
     statusCode === 402 ||
     statusCode === 403 ||
     statusCode === 410 ||
     (statusCode !== undefined && OUTAGE_STATUS_CODES.has(statusCode)) ||
-    (typeof err.type === 'string' && FAILOVER_ERROR_TYPES.has(err.type))
-  ) {
-    return true;
-  }
-  if (
-    [err.code, err.cause?.code, err.data?.code].some(
-      (code) => typeof code === 'string' && TRANSPORT_CODES.has(code),
-    )
-  ) {
-    return true;
-  }
+    (typeof err.type === 'string' && FAILOVER_ERROR_TYPES.has(err.type));
+
+  const transportCodeMatches = [err.code, err.cause?.code, err.data?.code].some(
+    (code) => typeof code === 'string' && TRANSPORT_CODES.has(code),
+  );
 
   const messages = [
     err.message ?? '',
     err.data?.message ?? '',
     err.data?.responseBody ?? '',
   ];
-  if (
-    messages.some((message) =>
-      TRANSPORT_MESSAGE_PATTERNS.some((p) => p.test(message)),
-    )
-  ) {
-    return true;
-  }
+  const transportMessageMatches = messages.some((message) =>
+    TRANSPORT_MESSAGE_PATTERNS.some((p) => p.test(message)),
+  );
 
-  const text = [
-    err.message ?? '',
-    err.data?.message ?? '',
-    err.data?.responseBody ?? '',
-  ].join(' ');
+  const text = messages.join(' ');
+  // Providers sometimes return recoverable rate-limit/outage payloads with an
+  // HTTP 400 wrapper: let a recognizable failover body continue, but keep
+  // application-level 400 failures hard.
   const hasFailoverReason =
     RETRYABLE_ERROR_PATTERNS.some((p) => p.test(text)) ||
     PROVIDER_OUTAGE_PATTERNS.some((p) => p.test(text));
-  // Providers sometimes return recoverable rate-limit/outage payloads with
-  // an HTTP 400 wrapper. Preserve application-level 400 failures, but let a
-  // recognizable failover body continue through the fallback path.
-  return hasFailoverReason;
+
+  const verdict =
+    statusMatches ||
+    transportCodeMatches ||
+    transportMessageMatches ||
+    hasFailoverReason;
+
+  // Diagnostic: confirm the provider → SDK → event status-code path without
+  // ever logging the response body or the user prompt.
+  if (probe.selected !== undefined) {
+    log('[foreground-fallback] failover status diagnosis', {
+      direct: asHttpStatus(err.statusCode) ?? null,
+      candidates: probe.candidates
+        .filter((candidate) => candidate.value !== undefined)
+        .map((candidate) => `${candidate.path}=${String(candidate.value)}`),
+      selected: probe.selected,
+      failover: verdict,
+    });
+  }
+
+  return verdict;
 }
 
 const INLINE_STATUS_CODES = new Set([401, 410]);
@@ -1753,18 +1838,22 @@ export class ForegroundFallbackManager {
       try {
         await abortSessionWithTimeout(getClient(this.input), sessionID);
       } catch (abortErr) {
-        // Unknown outcome: the abort transport failed — the admission
-        // state cannot be proven either way, so the prepared ownership
-        // CONVERTS into a tracked run instead of being dropped.
+        // Distinct from a retry-prompt failure: the abort transport failed.
+        // Unknown outcome — the admission state cannot be proven either way,
+        // so the prepared ownership CONVERTS into a tracked run instead of
+        // being dropped. Bounded: no further retry.
+        log('[foreground-fallback] fallback abort failed', {
+          sessionID,
+          targetModel,
+          error:
+            abortErr instanceof Error ? abortErr.message : String(abortErr),
+        });
         settleUnresolvedHandoff();
-        throw abortErr;
+        return;
       }
       await new Promise((r) => setTimeout(r, REPROMPT_DELAY_MS));
       // The abort/re-prompt-delay suspended across a dispose(): the
-      // second replay must not go through the old client. The first
-      // prompt's transport failed with an unknown outcome, so convert
-      // (never drop) the armed handoff exactly like the retry-failure
-      // path below.
+      // second replay must not go through the old client.
       if (this.abandonedByDispose(sessionID)) {
         settleUnresolvedHandoff();
         return;
@@ -1772,10 +1861,18 @@ export class ForegroundFallbackManager {
       try {
         promptResult = await promptAsync(promptBody);
       } catch (retryErr) {
-        // Transport failed without a response: the host may still
-        // have accepted the replay — convert, never drop.
+        // Distinct from an abort failure: the SECOND prompt was rejected.
+        // This is not a provider failure and must not trigger another retry;
+        // convert (never drop) the armed handoff and end the attempt so the
+        // caller's finally clears inProgress.
+        log('[foreground-fallback] retry prompt failed', {
+          sessionID,
+          targetModel,
+          error:
+            retryErr instanceof Error ? retryErr.message : String(retryErr),
+        });
         settleUnresolvedHandoff();
-        throw retryErr;
+        return;
       }
     }
 

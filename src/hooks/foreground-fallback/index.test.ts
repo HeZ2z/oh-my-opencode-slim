@@ -643,6 +643,76 @@ describe('isFailoverError', () => {
       false,
     );
   });
+
+  test('recognises HTTP status codes across every supported nested path', () => {
+    const paths: Array<{ name: string; make: (code: number) => unknown }> = [
+      { name: 'statusCode', make: (code) => ({ statusCode: code }) },
+      {
+        name: 'data.statusCode',
+        make: (code) => ({ data: { statusCode: code } }),
+      },
+      {
+        name: 'cause.statusCode',
+        make: (code) => ({ cause: { statusCode: code } }),
+      },
+      { name: 'status', make: (code) => ({ status: code }) },
+      {
+        name: 'response.status',
+        make: (code) => ({ response: { status: code } }),
+      },
+      {
+        name: 'response.statusCode',
+        make: (code) => ({ response: { statusCode: code } }),
+      },
+      { name: 'data.status', make: (code) => ({ data: { status: code } }) },
+      {
+        name: 'data.response.status',
+        make: (code) => ({ data: { response: { status: code } } }),
+      },
+      { name: 'cause.status', make: (code) => ({ cause: { status: code } }) },
+      {
+        name: 'cause.response.status',
+        make: (code) => ({ cause: { response: { status: code } } }),
+      },
+    ];
+    const failoverCodes = [401, 403, 410, 429, 500, 502, 503, 504];
+    for (const path of paths) {
+      for (const code of failoverCodes) {
+        expect({
+          path: path.name,
+          code,
+          result: isFailoverError(path.make(code)),
+        }).toEqual({ path: path.name, code, result: true });
+      }
+    }
+  });
+
+  test('ignores non-numeric and out-of-range status values', () => {
+    expect(isFailoverError({ statusCode: 'not-a-number' })).toBe(false);
+    expect(isFailoverError({ status: { code: 429 } })).toBe(false);
+    expect(isFailoverError({ data: { statusCode: '429O' } })).toBe(false);
+    expect(isFailoverError({ statusCode: 999 })).toBe(false);
+    expect(isFailoverError({ statusCode: 0 })).toBe(false);
+    expect(isFailoverError({ statusCode: 200 })).toBe(false);
+  });
+
+  test('400 stays a hard error unless the text is a recognised failover reason', () => {
+    expect(
+      isFailoverError({ statusCode: 400, message: 'invalid request' }),
+    ).toBe(false);
+    expect(
+      isFailoverError({ statusCode: 400, message: 'rate limit exceeded' }),
+    ).toBe(true);
+    expect(isFailoverError({ status: 400, message: 'provider outage' })).toBe(
+      true,
+    );
+  });
+
+  test('accepts a numeric-string status but keeps transport codes working', () => {
+    expect(isFailoverError({ statusCode: '429' })).toBe(true);
+    expect(isFailoverError({ cause: { code: 'ECONNRESET' } })).toBe(true);
+    expect(isFailoverError({ message: 'fetch failed' })).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1278,7 +1348,7 @@ describe('ForegroundFallbackManager session.error', () => {
     // refused — the replay may have been accepted. The prepared
     // ownership converts into a tracked run instead of being dropped.
     const { calls, handoff } = handoffMock();
-    await runFallbackScenario({
+    const mocks = await runFallbackScenario({
       handoff,
       messagesData: taskPrompt,
       promptAsyncImpl: async () => {
@@ -1293,6 +1363,32 @@ describe('ForegroundFallbackManager session.error', () => {
     expect(calls.admit).toEqual([]);
     expect(calls.reject).toEqual([]);
     expect(calls.settleUnresolved).toHaveLength(1);
+    // The abort failed before any second prompt was attempted.
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.abort).toHaveBeenCalledTimes(1);
+    expect(mgr.isFallbackInProgress('sess-1')).toBe(false);
+  });
+
+  test('a second promptAsync failure is bounded and distinct from an abort failure', async () => {
+    // First prompt rejected, abort succeeded, second prompt rejected: the
+    // retry-prompt failure is bounded (no further retry), converts the armed
+    // handoff, and leaves no permanent in-progress state.
+    const { calls, handoff } = handoffMock();
+    const mocks = await runFallbackScenario({
+      handoff,
+      messagesData: taskPrompt,
+      promptAsyncImpl: async () => {
+        throw new Error('transport failed twice');
+      },
+      abortImpl: async () => ({}),
+    });
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+    expect(mocks.abort).toHaveBeenCalledTimes(1);
+    expect(calls.settleUnresolved).toHaveLength(1);
+    expect(calls.admit).toEqual([]);
+    expect(calls.reject).toEqual([]);
+    expect(mgr.isFallbackInProgress('sess-1')).toBe(false);
   });
 
   test('switched:false still delivers — the handoff is admitted without the switch claim', async () => {
