@@ -187,6 +187,31 @@ function eventSessionID(props: {
   return props.sessionID ?? props.info?.id;
 }
 
+/**
+ * Resolve the model a message was produced with. Assistant messages carry
+ * `providerID`/`modelID` at the top level; the SDK's UserMessage nests them
+ * under `info.model` (`{ providerID, modelID }`). Both shapes are supported so
+ * a genuine user turn is recognised on real hosts.
+ */
+function messageModel(info: {
+  providerID?: unknown;
+  modelID?: unknown;
+  model?: unknown;
+}): string | undefined {
+  if (typeof info.providerID === 'string' && typeof info.modelID === 'string') {
+    return `${info.providerID}/${info.modelID}`;
+  }
+  const nested = info.model;
+  if (
+    isRecord(nested) &&
+    typeof nested.providerID === 'string' &&
+    typeof nested.modelID === 'string'
+  ) {
+    return `${nested.providerID}/${nested.modelID}`;
+  }
+  return undefined;
+}
+
 export function isFailoverError(error: unknown): boolean {
   if (!error) return false;
   if (typeof error === 'string') {
@@ -381,6 +406,25 @@ export class ForegroundFallbackManager {
    *   (one retry chance); 2 = exhausted again, aborted — stop intervening.
    *   Reset to 0 on successful responses or session deletion. */
   private readonly chainExhaustion = new Map<string, number>();
+  /** sessionID → incident-key → timestamp. Dedup is identity-based: only a
+   *  stable incident id (message id / request id) or a session.status retry
+   *  episode+attempt collapses duplicate notifications. Error text and a raw
+   *  time window are deliberately NOT used — identical text on the same model
+   *  can be the next real failure. */
+  private readonly lastTriggerMap = new Map<string, Map<string, number>>();
+  /** sessionID → current session.status retry episode. A higher attempt
+   *  advances the same episode; a repeated/out-of-order attempt already seen
+   *  in the episode is deduped; a model change starts a new episode. */
+  private readonly retryEpisode = new Map<
+    string,
+    {
+      model: string | undefined;
+      attempt: number;
+      id: number;
+      seen: Set<number>;
+    }
+  >();
+  private retryEpisodeSeq = 0;
   /** True once dispose() ran. `opencode reload` destroys this instance's
    *  context mid-attempt; in-flight fallback chains check this at every
    *  suspension point so their continuation never touches the old
@@ -613,15 +657,21 @@ export class ForegroundFallbackManager {
         if (typeof info.agent === 'string') {
           this.registerSessionAgent(sessionID, info.agent);
         }
-        // Track the model currently serving this session
-        if (
-          typeof info.providerID === 'string' &&
-          typeof info.modelID === 'string'
-        ) {
-          this.sessionModel.set(
-            sessionID,
-            `${info.providerID}/${info.modelID}`,
-          );
+        // Track the model currently serving this session. Assistant messages
+        // carry providerID/modelID at the top level; user messages (the SDK
+        // UserMessage shape) nest them under info.model.
+        const observedModel = messageModel(info);
+        if (observedModel !== undefined) {
+          this.sessionModel.set(sessionID, observedModel);
+        }
+        // A confirmed new USER turn earns recovery: it clears stage-2
+        // exhaustion and starts a fresh retry budget/episode. Guard on
+        // in-progress so our own fallback replay (which re-sends the user
+        // parts through promptAsync) cannot reset the state mid-descent. A
+        // late primary event from the old request is assistant-role and never
+        // reaches here.
+        if (info.role === 'user' && !this.inProgress.has(sessionID)) {
+          this.freshTurnResetHandler(sessionID, observedModel);
         }
         const messageTime = info.time;
         const isCompletedSuccessfulAssistant =
@@ -633,13 +683,24 @@ export class ForegroundFallbackManager {
           typeof messageTime.completed === 'number';
         // Failover-worthy error on an individual message
         if (info.error && isFailoverError(info.error)) {
-          const d = this.decideIntervention(sessionID, false);
-          if (d === 'absorb') {
-            await this.retryCurrentModel(sessionID, info.error);
-          } else if (d === 'fallback') {
-            await this.tryFallback(sessionID, info.error);
+          // Concurrency guard before any budget charge: a second event that
+          // arrives while a fallback/retry is already in flight must not
+          // consume a budget slot and then be dropped by the in-progress guard.
+          if (!this.isExhausted(sessionID) && !this.inProgress.has(sessionID)) {
+            // Duplicate `message.updated` notifications for the same message
+            // share the message id; a new message is a new incident.
+            const incidentId =
+              typeof info.id === 'string' && info.id ? info.id : undefined;
+            if (!this.isTerminalIncidentDeduped(sessionID, incidentId)) {
+              const d = this.decideIntervention(sessionID, false);
+              if (d === 'absorb') {
+                await this.retryCurrentModel(sessionID, info.error);
+              } else if (d === 'fallback') {
+                await this.tryFallback(sessionID, info.error);
+              }
+              // fallback-delayed → nothing
+            }
           }
-          // fallback-delayed → nothing
         } else if (isCompletedSuccessfulAssistant) {
           // Only a completed, successful assistant response proves recovery.
           this.sessionRetries.delete(sessionID);
@@ -655,6 +716,7 @@ export class ForegroundFallbackManager {
           // only grows across turns and each new descent starts one link
           // deeper.
           this.sessionTried.delete(sessionID);
+          this.retryEpisode.delete(sessionID);
           // Cancel any pending initial delay on recovery
           const pendingDelay = this.pendingInitialDelay.get(sessionID);
           if (pendingDelay) {
@@ -672,14 +734,20 @@ export class ForegroundFallbackManager {
         if (!props) break;
         const sessionID = eventSessionID(props);
         if (sessionID && props.error && isFailoverError(props.error)) {
-          const d = this.decideIntervention(sessionID, false);
-          if (d === 'absorb') {
-            await this.retryCurrentModel(sessionID, props.error);
-          } else if (d === 'fallback') {
-            // Dedup stays inside tryFallback.
-            await this.tryFallback(sessionID, props.error);
+          if (!this.isExhausted(sessionID) && !this.inProgress.has(sessionID)) {
+            // No correlatable id -> never dedupe (identical text may be the
+            // next real failure).
+            const incidentId = this.stableEventIncidentId(props);
+            if (!this.isTerminalIncidentDeduped(sessionID, incidentId)) {
+              const d = this.decideIntervention(sessionID, false);
+              if (d === 'absorb') {
+                await this.retryCurrentModel(sessionID, props.error);
+              } else if (d === 'fallback') {
+                await this.tryFallback(sessionID, props.error);
+              }
+              // fallback-delayed → nothing
+            }
           }
-          // fallback-delayed → nothing
         }
         break;
       }
@@ -703,11 +771,12 @@ export class ForegroundFallbackManager {
               isFailoverError({ message: props.status.message })));
         if (isFailoverRetry) {
           // Guard: stale retry event from a previous model's retry loop.
-          // After a fallback, lastTriggerModel holds the OLD model (set by
-          // isDeduped before the fallback), while sessionModel holds the NEW
-          // model. A stale retry from the old model arrives with attempt > 1
-          // (continuation of old retry loop). A genuine retry from the new
-          // model arrives with attempt === 1 (first retry for new model).
+          // After a fallback, lastTriggerModel holds the OLD model (anchored
+          // by isHostRetryDeduped before the fallback), while sessionModel
+          // holds the NEW model. A stale retry from the old model arrives with
+          // attempt > 1 (continuation of old retry loop). A genuine retry from
+          // the new model arrives with attempt === 1 (first retry for new
+          // model).
           const prevModel = this.lastTriggerModel.get(sessionID);
           const curModel = this.sessionModel.get(sessionID);
           const lastTriggerTime = this.lastTrigger.get(sessionID) ?? 0;
@@ -726,6 +795,9 @@ export class ForegroundFallbackManager {
           }
           // Otherwise (attempt === 1, or model didn't change, or outside
           // dedup window): process as genuine retry for current model.
+          if (this.isExhausted(sessionID)) break;
+          if (this.inProgress.has(sessionID)) break;
+          if (this.isHostRetryDeduped(sessionID, attempt)) break;
           const d = this.decideIntervention(sessionID, true);
           if (d === 'fallback') {
             // Failover may have been detected from status.message (e.g.
@@ -784,6 +856,24 @@ export class ForegroundFallbackManager {
             sessionID: id,
           });
           this.sessionParent.delete(id);
+          // Clear every session-level map directly too: exhausted state and
+          // dedup episodes must never leak into a reused session id.
+          this.sessionModel.delete(id);
+          this.sessionAgent.delete(id);
+          this.sessionTried.delete(id);
+          this.lastTrigger.delete(id);
+          this.lastTriggerModel.delete(id);
+          this.lastTriggerMap.delete(id);
+          this.retryEpisode.delete(id);
+          this.sessionRetries.delete(id);
+          this.initialDelayScheduled.delete(id);
+          this.chainExhaustion.delete(id);
+          this.lastFallbackTime.delete(id);
+          const pendingDelay = this.pendingInitialDelay.get(id);
+          if (pendingDelay) {
+            clearTimeout(pendingDelay);
+            this.pendingInitialDelay.delete(id);
+          }
         }
         break;
       }
@@ -972,11 +1062,9 @@ export class ForegroundFallbackManager {
     // No chain -> no fallback. Skip before dedup so we don't stamp lastTrigger
     // for sessions we will never re-prompt (e.g. councillor via CouncilManager).
     if (!this.hasFallbackChain(sessionID)) return;
-
-    // Deduplicate: multiple events can fire for a single rate-limit event.
-    // Bypass dedup when the model changed since the last trigger - the new
-    // model's failure is a separate incident and the cascade should continue.
-    if (this.isDeduped(sessionID)) return;
+    // Terminal stage-2 exhaustion: never intervene again for this session.
+    // Dedup happens upstream; do not rely on it to prevent a repeat abort.
+    if (this.isExhausted(sessionID)) return;
 
     // Set inProgress before delay to prevent concurrent fallback attempts
     this.inProgress.add(sessionID);
@@ -1083,7 +1171,7 @@ export class ForegroundFallbackManager {
     if (this.inProgress.has(sessionID)) return;
     if (!this.hasFallbackChain(sessionID)) return;
     if (this.withholdsAbortForLiveChildren(sessionID)) return;
-    if (this.isDeduped(sessionID)) return;
+    if (this.isExhausted(sessionID)) return;
 
     this.inProgress.add(sessionID);
     try {
@@ -1104,21 +1192,142 @@ export class ForegroundFallbackManager {
     }
   }
 
-  private isDeduped(sessionID: string): boolean {
-    const now = Date.now();
-    const curModel = this.sessionModel.get(sessionID);
-    const modelChanged =
-      this.lastTriggerModel.has(sessionID) &&
-      this.lastTriggerModel.get(sessionID) !== curModel;
-    if (
-      !modelChanged &&
-      now - (this.lastTrigger.get(sessionID) ?? 0) < DEDUP_WINDOW_MS
-    )
-      return true;
-    this.lastTrigger.set(sessionID, now);
-    if (curModel !== undefined) {
-      this.lastTriggerModel.set(sessionID, curModel);
+  /** True once the chain has been finally exhausted and aborted. */
+  private isExhausted(sessionID: string): boolean {
+    return (this.chainExhaustion.get(sessionID) ?? 0) >= 2;
+  }
+
+  /** Clear stage-2 exhaustion and the spent retry budget/episode when a fresh
+   *  user turn returns the session to the chain primary, so recovery is never
+   *  permanently sealed and the new turn earns the configured retry budget. */
+  private freshTurnResetHandler(
+    sessionID: string,
+    newModel: string | undefined,
+  ): void {
+    if ((this.chainExhaustion.get(sessionID) ?? 0) !== 2) return;
+    const agentName = this.sessionAgent.get(sessionID);
+    if (!agentName) return;
+    const chain = this.chains[agentName];
+    if (!chain || chain.length === 0) return;
+    if (newModel !== undefined && newModel !== chain[0]) return;
+    this.chainExhaustion.delete(sessionID);
+    // The new turn re-sends the configured primary, so the spent budget and
+    // the retry episode reset too: the first failure of the new turn gets the
+    // full configured current-model retries again before falling back.
+    this.sessionRetries.delete(sessionID);
+    this.initialDelayScheduled.delete(sessionID);
+    this.retryEpisode.delete(sessionID);
+    log('[foreground-fallback] fresh turn reset from stage-2', {
+      sessionID,
+      agentName,
+      model: newModel,
+    });
+  }
+
+  /** Stable identity for a terminal incident, or undefined when the event
+   *  carries nothing correlatable. Without an id we must NOT dedupe: identical
+   *  error text on the same model can be the next real failure. */
+  private stableEventIncidentId(props: {
+    messageID?: unknown;
+    messageId?: unknown;
+    requestID?: unknown;
+    requestId?: unknown;
+    info?: { messageID?: unknown; id?: unknown } | undefined;
+    error?: unknown;
+  }): string | undefined {
+    const direct = [
+      props.messageID,
+      props.messageId,
+      props.requestID,
+      props.requestId,
+      props.info?.messageID,
+    ];
+    for (const candidate of direct) {
+      if (typeof candidate === 'string' && candidate) return candidate;
     }
+    if (isRecord(props.error)) {
+      const err = props.error as {
+        requestID?: unknown;
+        requestId?: unknown;
+        data?: { requestID?: unknown; requestId?: unknown };
+      };
+      const nested = [
+        err.requestID,
+        err.requestId,
+        err.data?.requestID,
+        err.data?.requestId,
+      ];
+      for (const candidate of nested) {
+        if (typeof candidate === 'string' && candidate) return candidate;
+      }
+    }
+    return undefined;
+  }
+
+  /** Dedup a terminal incident by stable id only. No id -> never dedupe. */
+  private isTerminalIncidentDeduped(
+    sessionID: string,
+    incidentId: string | undefined,
+  ): boolean {
+    if (!incidentId) return false;
+    const model = this.sessionModel.get(sessionID) ?? 'none';
+    return this.recordIncident(sessionID, `terminal|${model}|${incidentId}`);
+  }
+
+  /** Dedup `session.status` retry events by retry episode + attempt. A higher
+   *  attempt advances the same episode; a repeated or out-of-order attempt
+   *  already seen in the episode is deduped (hosts may re-send or reorder). A
+   *  model change starts a new episode (and therefore a new incident key). */
+  private isHostRetryDeduped(sessionID: string, attempt: number): boolean {
+    const model = this.sessionModel.get(sessionID);
+    const episode = this.retryEpisode.get(sessionID);
+
+    if (episode !== undefined && episode.model === model) {
+      if (episode.seen.has(attempt)) {
+        // Re-sent or out-of-order duplicate of an attempt already handled.
+        return true;
+      }
+      episode.seen.add(attempt);
+      episode.attempt = Math.max(episode.attempt, attempt);
+      const key = `host-retry|${model ?? 'none'}|${episode.id}|${attempt}`;
+      if (this.recordIncident(sessionID, key)) return true;
+      this.lastTrigger.set(sessionID, Date.now());
+      if (model !== undefined) this.lastTriggerModel.set(sessionID, model);
+      return false;
+    }
+
+    const active = {
+      model,
+      attempt,
+      id: ++this.retryEpisodeSeq,
+      seen: new Set<number>([attempt]),
+    };
+    this.retryEpisode.set(sessionID, active);
+    const key = `host-retry|${model ?? 'none'}|${active.id}|${attempt}`;
+    if (this.recordIncident(sessionID, key)) return true;
+    // Anchor the legacy stale-retry guard on the recorded (non-duplicate)
+    // retry notification: model change + attempt > 1 upstream means stale.
+    this.lastTrigger.set(sessionID, Date.now());
+    if (model !== undefined) this.lastTriggerModel.set(sessionID, model);
+    return false;
+  }
+
+  /** Record an incident key; true when it is a duplicate inside the window. */
+  private recordIncident(sessionID: string, key: string): boolean {
+    const now = Date.now();
+    let map = this.lastTriggerMap.get(sessionID);
+    if (!map) {
+      map = new Map<string, number>();
+      this.lastTriggerMap.set(sessionID, map);
+    }
+    const last = map.get(key);
+    if (last !== undefined && now - last < DEDUP_WINDOW_MS) {
+      return true;
+    }
+    for (const [existingKey, timestamp] of map) {
+      if (now - timestamp >= DEDUP_WINDOW_MS) map.delete(existingKey);
+    }
+    map.set(key, now);
     return false;
   }
 
@@ -1189,6 +1398,7 @@ export class ForegroundFallbackManager {
       this.chainExhaustion.delete(sessionID);
       this.sessionRetries.delete(sessionID);
       this.initialDelayScheduled.delete(sessionID);
+      this.retryEpisode.delete(sessionID);
     }
 
     // After the chain has been exhausted twice (reset retry failed and we

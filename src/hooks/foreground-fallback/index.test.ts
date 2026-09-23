@@ -3369,17 +3369,16 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
       expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
       expect(mocks.abort).toHaveBeenCalledTimes(1);
 
-      // Deliberately omit time.completed: this is not a successful response;
-      // recovery must come from the fresh descent reset instead.
+      // A confirmed new USER turn returning to the primary clears stage-2.
+      // Uses the real SDK UserMessage shape: the model is nested.
       await mgr.handleEvent({
         type: 'message.updated',
         properties: {
           info: {
             sessionID,
             agent: 'orchestrator',
-            providerID: 'openai',
-            modelID: 'gpt-b',
-            role: 'assistant',
+            role: 'user',
+            model: { providerID: 'openai', modelID: 'gpt-b' },
           },
         },
       });
@@ -3394,6 +3393,156 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
         }),
       );
       expect(mgr.willAttemptFallback(sessionID)).toBe(true);
+    } finally {
+      Date.now = realNowFn;
+    }
+  });
+
+  test('a real SDK user message resets exhaustion and the retry budget', async () => {
+    const { mocks } = createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      { directory: '/test' } as any,
+      1, // maxRetries=1 so the budget reset is observable
+    );
+    const sessionID = 'sess-sdk-user-reset';
+
+    const realNowFn = Date.now;
+    let fakeNow = realNowFn();
+    Date.now = () => fakeNow;
+    try {
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID,
+            agent: 'orchestrator',
+            providerID: 'openai',
+            modelID: 'gpt-b',
+            role: 'assistant',
+          },
+        },
+      });
+
+      const fail = async () => {
+        fakeNow += 6_000;
+        await mgr.handleEvent({
+          type: 'session.error',
+          properties: {
+            sessionID,
+            error: { message: 'rate limit exceeded' },
+          },
+        });
+      };
+
+      // maxRetries=1: error 1 absorbed (same-model retry), 2 falls back,
+      // 3 sticky re-prompt, 4 second exhaustion → abort.
+      await fail();
+      await fail();
+      await fail();
+      await fail();
+      expect(mocks.abort).toHaveBeenCalledTimes(1);
+      expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+
+      // Real SDK user message: model nested under info.model, back to primary.
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID,
+            agent: 'orchestrator',
+            role: 'user',
+            model: { providerID: 'openai', modelID: 'gpt-b' },
+          },
+        },
+      });
+
+      expect((mgr as any).chainExhaustion.has(sessionID)).toBe(false);
+      expect((mgr as any).sessionRetries.has(sessionID)).toBe(false);
+      expect(mgr.willAttemptFallback(sessionID)).toBe(true);
+
+      // The new turn's first failure must be absorbed as a same-model retry,
+      // not jump straight to fallback — proving the budget was reset.
+      const before = mocks.promptAsync.mock.calls.length;
+      await fail();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(before + 1);
+      const lastCall = mocks.promptAsync.mock.calls.at(-1) as [
+        { body: { model: { providerID: string; modelID: string } } },
+      ];
+      expect(lastCall[0].body.model).toEqual({
+        providerID: 'openai',
+        modelID: 'gpt-b',
+      });
+      expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+    } finally {
+      Date.now = realNowFn;
+    }
+  });
+
+  test('a late primary event that is not a new user turn keeps exhaustion', async () => {
+    const { mocks } = createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      { directory: '/test' } as any,
+      0,
+    );
+    const sessionID = 'sess-late-primary';
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          agent: 'orchestrator',
+          providerID: 'openai',
+          modelID: 'gpt-b',
+          role: 'assistant',
+        },
+      },
+    });
+
+    const realNowFn = Date.now;
+    let fakeNow = realNowFn();
+    Date.now = () => fakeNow;
+    try {
+      const fail = async () => {
+        fakeNow += 6_000;
+        await mgr.handleEvent({
+          type: 'session.error',
+          properties: {
+            sessionID,
+            error: { message: 'rate limit exceeded' },
+          },
+        });
+      };
+
+      await fail();
+      await fail();
+      await fail();
+      expect(mocks.abort).toHaveBeenCalledTimes(1);
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+
+      // A LATE primary-model event from the old request — assistant role, so
+      // not a new user turn. It must not re-open the terminal guard.
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID,
+            agent: 'orchestrator',
+            providerID: 'openai',
+            modelID: 'gpt-b',
+            role: 'assistant',
+          },
+        },
+      });
+
+      await fail();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+      expect(mocks.abort).toHaveBeenCalledTimes(1);
+      expect(mgr.willAttemptFallback(sessionID)).toBe(false);
     } finally {
       Date.now = realNowFn;
     }
@@ -4210,7 +4359,10 @@ describe('ForegroundFallbackManager inherit + fallback chain', () => {
 // ---------------------------------------------------------------------------
 
 describe('ForegroundFallbackManager deduplication', () => {
-  test('ignores a second trigger within dedup window for same session', async () => {
+  test('terminal events without a correlatable id are never deduped by time', async () => {
+    // Two independent session.error events with identical text and no shared
+    // id must BOTH be processed: a fixed time window must never swallow the
+    // next real failure.
     const { mocks } = createMockClient();
     const mgr = new ForegroundFallbackManager(
       makeChains(),
@@ -4230,9 +4382,248 @@ describe('ForegroundFallbackManager deduplication', () => {
     };
 
     await mgr.handleEvent(event);
-    await mgr.handleEvent(event); // immediate second trigger - should be deduped
+    await mgr.handleEvent(event);
+
+    // maxRetries=0: both advance the chain (link 2, then link 3).
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+  });
+
+  test('duplicate message.updated notifications sharing a message id dedupe', async () => {
+    const { mocks } = createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      { directory: '/test' } as any,
+      0,
+    );
+
+    const event = {
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-dup-id',
+          id: 'msg-1',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+          error: { message: 'rate limit exceeded' },
+        },
+      },
+    };
+
+    await mgr.handleEvent(event);
+    await mgr.handleEvent(event);
 
     expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('a new message id with identical error text is a new incident', async () => {
+    const { mocks } = createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      { directory: '/test' } as any,
+      0,
+    );
+
+    const event = (id: string) => ({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-new-id',
+          id,
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+          error: { message: 'rate limit exceeded' },
+        },
+      },
+    });
+
+    await mgr.handleEvent(event('msg-1'));
+    await mgr.handleEvent(event('msg-2'));
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+  });
+
+  test('session.status dedupes a repeated attempt but processes an incremented one', async () => {
+    const { mocks } = createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      { directory: '/test' } as any,
+      1, // maxRetries=1: attempt 1 is host-absorbed, attempt 2 falls back
+    );
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-ep',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+        },
+      },
+    });
+    const retry = (attempt: number) => ({
+      type: 'session.status',
+      properties: {
+        sessionID: 'sess-ep',
+        status: {
+          type: 'retry',
+          attempt,
+          message: 'rate limit, retrying...',
+        },
+      },
+    });
+
+    await mgr.handleEvent(retry(1)); // host-absorbed
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+    await mgr.handleEvent(retry(1)); // duplicate attempt -> deduped, no charge
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+    await mgr.handleEvent(retry(2)); // next attempt -> budget exhausted -> fallback
+    expect(mocks.abort).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('reusing a deleted session id starts from fresh fallback state', async () => {
+    const coordinator = new SessionLifecycle();
+    const { mocks } = createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      { directory: '/test' } as any,
+      0,
+      coordinator,
+    );
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-reuse',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+          error: { message: 'rate limit exceeded' },
+        },
+      },
+    });
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+
+    await mgr.handleEvent({
+      type: 'session.deleted',
+      properties: { info: { id: 'sess-reuse' } },
+    });
+
+    const internal = mgr as unknown as {
+      sessionModel: Map<string, string>;
+      sessionTried: Map<string, Set<string>>;
+      lastTriggerMap: Map<string, unknown>;
+      chainExhaustion: Map<string, number>;
+    };
+    expect(internal.sessionModel.has('sess-reuse')).toBe(false);
+    expect(internal.sessionTried.has('sess-reuse')).toBe(false);
+    expect(internal.lastTriggerMap.has('sess-reuse')).toBe(false);
+    expect(internal.chainExhaustion.has('sess-reuse')).toBe(false);
+  });
+
+  test('a concurrent terminal event does not consume budget while a retry is in flight', async () => {
+    let resolveMessages!: (value: unknown) => void;
+    const messagesPromise = new Promise((resolve) => {
+      resolveMessages = resolve;
+    });
+    const { mocks } = createMockClient({
+      messagesImpl: () => messagesPromise,
+    });
+    const mgr = new ForegroundFallbackManager(
+      makeChains({
+        orchestrator: ['openai/gpt-b', 'openai/gpt-c', 'openai/gpt-d'],
+      }),
+      true,
+      { directory: '/test' } as any,
+      1,
+    );
+    const sessionID = 'sess-concurrent-budget';
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: { sessionID, providerID: 'openai', modelID: 'gpt-b' },
+      },
+    });
+
+    const error = (id: string) => ({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          id,
+          providerID: 'openai',
+          modelID: 'gpt-b',
+          error: { message: 'rate limit exceeded' },
+        },
+      },
+    });
+
+    // First event consumes one budget slot and suspends on the transcript read.
+    const first = mgr.handleEvent(error('m1'));
+    expect(mgr.isFallbackInProgress(sessionID)).toBe(true);
+
+    // A distinct event arriving while in flight must NOT burn budget.
+    await mgr.handleEvent(error('m2'));
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+
+    resolveMessages({
+      data: [
+        {
+          info: { role: 'user', id: 'u1' },
+          parts: [{ type: 'text', text: 'hi' }],
+        },
+      ],
+    });
+    await first;
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+  });
+
+  test('a repeated out-of-order retry attempt is deduped, not a new episode', async () => {
+    createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      { directory: '/test' } as any,
+      3,
+    );
+    const sessionID = 'sess-out-of-order';
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+        },
+      },
+    });
+    const retry = (attempt: number) => ({
+      type: 'session.status',
+      properties: {
+        sessionID,
+        status: {
+          type: 'retry',
+          attempt,
+          message: 'rate limit, retrying...',
+        },
+      },
+    });
+
+    await mgr.handleEvent(retry(1));
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+    await mgr.handleEvent(retry(2));
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(2);
+    // Re-sent / out-of-order attempt 1 must dedupe, not start a new episode.
+    await mgr.handleEvent(retry(1));
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(2);
   });
 
   test('different sessions are not deduplicated against each other', async () => {
