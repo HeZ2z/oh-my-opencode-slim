@@ -472,8 +472,8 @@ running session.
 
 `fallback.maxRetries` is unrelated to the wall-clock supervisor and to
 OpenCode's provider retry policy. A value of `0` disables Slim's foreground
-429 failover budget; it does not prevent OpenCode from retrying a provider
-request in a child session.
+retry budget; it does not prevent OpenCode from retrying a provider request in
+a child session.
 
 ### Agent Display Names
 
