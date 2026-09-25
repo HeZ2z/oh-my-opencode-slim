@@ -39,6 +39,7 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
 - **Event coverage**: `message.updated` (message metadata error), `session.error` (session-level error), `session.status` (`retry` status)
 
 ### Retry Budget and Exhaustion
+- The v2 in-place retry hook shares the chain-global budget and permanent-quota exhaustion policy; absorbed retries leave the host decision unchanged.
 - `maxRetries = N` absorbs failures `1..N` on the current model; failure `N+1` (and every later failure) advances the chain. `maxRetries = 0` switches immediately.
 - The budget is **chain-global** and is not cleared on a model switch.
 - Cleared only on: a completed successful assistant response, `session.deleted`, or a confirmed new user turn.

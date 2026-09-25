@@ -117,7 +117,7 @@ const retryMgr = (
     { orchestrator: ids.map((id) => `test/${id}`) },
     true,
     { directory: '/test' } as any,
-    3,
+    0,
     undefined,
     onChanged,
   );
@@ -135,6 +135,29 @@ const retryEvent = (
 });
 
 describe('ForegroundFallbackManager v2 retry hook', () => {
+  test('shares the retry budget across in-place model switches', async () => {
+    createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['test/A', 'test/B', 'test/C'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+    );
+    const switchModel = mock(async () => {});
+    await mgr.handleV2Retry(retryEvent('budget', 'A'), switchModel);
+    expect(switchModel).not.toHaveBeenCalled();
+    await mgr.handleV2Retry(retryEvent('budget', 'A'), switchModel);
+    expect(switchModel).toHaveBeenLastCalledWith('budget', {
+      providerID: 'test',
+      id: 'B',
+    });
+    await mgr.handleV2Retry(retryEvent('budget', 'B'), switchModel);
+    expect(switchModel).toHaveBeenLastCalledWith('budget', {
+      providerID: 'test',
+      id: 'C',
+    });
+  });
+
   test.each([{ retry: true, delay: 2000 }, { retry: false }])(
     'switches in place without abort or re-prompt (initial decision %p)',
     async (decision) => {
@@ -2136,7 +2159,7 @@ describe('ForegroundFallbackManager v1 abort protection for live children', () =
       chain,
       true,
       { directory: '/test', hostFlavor } as any,
-      3,
+      0,
       undefined,
       undefined,
       0,
@@ -4178,6 +4201,7 @@ describe('ForegroundFallbackManager inherit + fallback chain', () => {
       { oracle: ['openai/gpt-a', 'openai/gpt-b'] },
       true,
       { directory: '/test' } as any,
+      0,
     );
     const sessionID = 'sess-combined-first';
 
@@ -4205,6 +4229,7 @@ describe('ForegroundFallbackManager inherit + fallback chain', () => {
       { oracle: ['openai/gpt-a', 'openai/gpt-b'] },
       true,
       { directory: '/test' } as any,
+      0,
     );
     const sessionID = 'sess-combined-descend';
 
@@ -4247,6 +4272,7 @@ describe('ForegroundFallbackManager inherit + fallback chain', () => {
       { oracle: ['openai/gpt-a', 'openai/gpt-b'] },
       true,
       { directory: '/test' } as any,
+      0,
     );
     const sessionID = 'sess-combined-inchain';
 
@@ -4272,6 +4298,7 @@ describe('ForegroundFallbackManager inherit + fallback chain', () => {
       { oracle: ['openai/gpt-a'] },
       true,
       { directory: '/test' } as any,
+      0,
     );
     mgr.disableChain('oracle');
     const sessionID = 'sess-combined-disabled';
@@ -4297,6 +4324,7 @@ describe('ForegroundFallbackManager inherit + fallback chain', () => {
       { oracle: ['openai/gpt-a', 'openai/gpt-b'] },
       true,
       { directory: '/test' } as any,
+      0,
     );
     const sessionID = 'sess-combined-bounded';
 
@@ -4356,6 +4384,7 @@ describe('ForegroundFallbackManager inherit + fallback chain', () => {
       { oracle: ['openai/gpt-a', 'openai/gpt-b'] },
       true,
       { directory: '/test' } as any,
+      0,
     );
     const sessionID = 'sess-combined-rearm';
 
@@ -4384,6 +4413,17 @@ describe('ForegroundFallbackManager inherit + fallback chain', () => {
 
       // The session returns to the CONFIGURED primary (gpt-a): the tried
       // set resets and a fresh descent from gpt-a is allowed.
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID,
+            agent: 'oracle',
+            role: 'user',
+            model: { providerID: 'openai', modelID: 'gpt-a' },
+          },
+        },
+      });
       await fail('openai/gpt-a');
       expect(mocks.promptAsync).toHaveBeenCalledTimes(4);
       expect(mocks.promptAsync.mock.calls[3]?.[0]).toEqual(
@@ -4409,6 +4449,7 @@ describe('ForegroundFallbackManager inherit + fallback chain', () => {
       { oracle: ['openai/gpt-a', 'openai/gpt-b'] },
       true,
       { directory: '/test' } as any,
+      0,
     );
     const sessionID = 'sess-combined-success-reset';
 

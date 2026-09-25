@@ -1087,7 +1087,10 @@ export class ForegroundFallbackManager {
       if (!this.enabled || this.disposed || this.inProgress.has(sessionID))
         return;
       if (!isFailoverError(event.error)) return;
-      if (this.initialRetryDelayMs > 0) {
+      if (
+        this.initialRetryDelayMs > 0 &&
+        !isPermanentUsageQuotaError(event.error)
+      ) {
         log('[foreground-fallback] retry hook skipped initial delay', {
           sessionID,
         });
@@ -1100,6 +1103,13 @@ export class ForegroundFallbackManager {
         return;
       if (event.agent) this.registerSessionAgent(sessionID, event.agent);
       this.sessionModel.set(sessionID, from);
+      if (this.isExhausted(sessionID)) return;
+      if (!this.hasFallbackChain(sessionID)) return;
+      if (
+        !isPermanentUsageQuotaError(event.error) &&
+        !this.consumeRetryBudget(sessionID)
+      )
+        return;
       const selected = this.selectFallbackModel(sessionID, event.error);
       if (!selected || selected === 'exhausted') return;
       const { agentName, nextModel, ref } = selected;
@@ -1973,7 +1983,7 @@ export class ForegroundFallbackManager {
     try {
       promptResult = await promptAsync(promptBody);
     } catch (promptErr) {
-    if (isV2Host) {
+      if (isV2Host) {
         // v2 steer delivery does not reject with BusyError: any rejected
         // replay is final, not a signal to retry. An abort cannot make
         // the admission succeed and may kill a promoted background job.
