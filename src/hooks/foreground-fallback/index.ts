@@ -616,6 +616,10 @@ export class ForegroundFallbackManager {
    *  session answer `{ retry: false }` until a genuine new user turn returns
    *  to the configured primary (or the session is deleted/disposed). */
   private readonly v2RetryTerminal = new Set<string>();
+  /** sessionID → turn epoch, bumped whenever a confirmed external user turn
+   *  resets the session. An in-flight replay captures the epoch and refuses to
+   *  write model/switch state (or restore old state) once a newer turn began. */
+  private readonly turnEpoch = new Map<string, number>();
   /** True once dispose() ran. `opencode reload` destroys this instance's
    *  context mid-attempt; in-flight fallback chains check this at every
    *  suspension point so their continuation never touches the old
@@ -721,6 +725,7 @@ export class ForegroundFallbackManager {
     this.pendingReplay.clear();
     this.replayMessageIds.clear();
     this.v2RetryTerminal.clear();
+    this.turnEpoch.clear();
   }
 
   /** Dispose fence for fallback chains: true when this generation was
@@ -1075,6 +1080,7 @@ export class ForegroundFallbackManager {
           this.pendingReplay.delete(id);
           this.replayMessageIds.delete(id);
           this.v2RetryTerminal.delete(id);
+          this.turnEpoch.delete(id);
         }
         break;
       }
@@ -1475,36 +1481,48 @@ export class ForegroundFallbackManager {
     ) {
       return true;
     }
-    // Still inside our own replay (promptAsync has not returned yet).
-    if (this.inProgress.has(sessionID)) return true;
+
+    const inFlight = this.inProgress.has(sessionID);
+    if (messageId === undefined) {
+      // No identity to check: only an in-flight replay can explain it.
+      return inFlight;
+    }
 
     const pending = this.pendingReplay.get(sessionID);
-    if (pending) {
-      const expired =
-        Date.now() - pending.startedAt > REPLAY_IDENTITY_WINDOW_MS;
-      if (!expired && messageId !== undefined) {
-        if (messageId === pending.baselineMessageID) {
-          // Re-emission of a message we already knew about — not a new turn.
-          return true;
-        }
-        if (await this.isInternalReplayMessage(sessionID, messageId)) {
-          // Our own replay message, possibly delivered after the prompt
-          // returned. Confirm and retain its id, then keep the descent state.
-          this.rememberReplayMessageId(sessionID, messageId);
-          // Delete only the record we examined: a newer replay may have
-          // registered while the transcript read was in flight.
-          if (this.pendingReplay.get(sessionID) === pending) {
-            this.pendingReplay.delete(sessionID);
-          }
-          return true;
-        }
-      }
-      // Anything we cannot positively identify as our replay is a real turn.
-      if (this.pendingReplay.get(sessionID) === pending) {
-        this.pendingReplay.delete(sessionID);
-      }
+    const pendingUsable =
+      pending !== undefined &&
+      Date.now() - pending.startedAt <= REPLAY_IDENTITY_WINDOW_MS;
+
+    if (pendingUsable && pending && messageId === pending.baselineMessageID) {
+      // Re-emission of a message we already knew about — not a new turn.
+      return true;
     }
-    return false;
+
+    const identity =
+      pendingUsable || inFlight
+        ? await this.probeReplayMessageIdentity(sessionID, messageId)
+        : 'external';
+
+    if (
+      pendingUsable &&
+      pending &&
+      this.pendingReplay.get(sessionID) === pending
+    ) {
+      this.pendingReplay.delete(sessionID);
+    }
+
+    if (identity === 'internal') {
+      this.rememberReplayMessageId(sessionID, messageId);
+      return true;
+    }
+    if (identity === 'external') {
+      // Present in the transcript without the marker: a real new turn, even
+      // while our own replay is still in flight.
+      return false;
+    }
+    // Unknown (not persisted yet): assume ours only while a replay is in
+    // flight; otherwise it is a real turn.
+    return inFlight;
   }
 
   /** Retain a user message id confirmed as our own internal replay. */
@@ -1517,12 +1535,16 @@ export class ForegroundFallbackManager {
     ids.add(messageId);
   }
 
-  /** Confirm a user message carries the internal-initiator marker we attach to
-   *  fallback replays. Reads only the transcript tail. */
-  private async isInternalReplayMessage(
+  /** Classify a user message by its transcript identity:
+   *   - `'internal'`  — carries the internal-initiator marker we attach to
+   *     fallback replays;
+   *   - `'external'`  — present in the transcript without the marker;
+   *   - `'unknown'`   — not found yet (the host may not have persisted it).
+   *  Reads only the transcript tail. */
+  private async probeReplayMessageIdentity(
     sessionID: string,
     messageId: string,
-  ): Promise<boolean> {
+  ): Promise<'internal' | 'external' | 'unknown'> {
     try {
       const session = getClient(this.input).session;
       const result = await session.messages({
@@ -1533,7 +1555,7 @@ export class ForegroundFallbackManager {
       const target = [...messages]
         .reverse()
         .find((m) => messageID(m) === messageId);
-      if (!isRecord(target)) return false;
+      if (!isRecord(target)) return 'unknown';
 
       // v1: part-level synthetic metadata (or a text part carrying the marker).
       if (Array.isArray(target.parts)) {
@@ -1545,21 +1567,21 @@ export class ForegroundFallbackManager {
               (isRecord(part) && hasInternalMarkerText(part.text)),
           )
         ) {
-          return true;
+          return 'internal';
         }
       }
       // v2 flat shape: the marker survives as joined text (the shim appends
       // the marker comment to the part text) and/or message-level metadata.
-      if (hasInternalMarkerText(target.text)) return true;
+      if (hasInternalMarkerText(target.text)) return 'internal';
       if (
         isRecord(target.metadata) &&
         target.metadata[INTERNAL_INITIATOR_METADATA_KEY] === true
       ) {
-        return true;
+        return 'internal';
       }
-      return false;
+      return 'external';
     } catch {
-      return false;
+      return 'unknown';
     }
   }
 
@@ -1585,6 +1607,11 @@ export class ForegroundFallbackManager {
     this.lastTriggerModel.delete(sessionID);
     this.lastTriggerMap.delete(sessionID);
     this.lastFallbackTime.delete(sessionID);
+    // A new turn invalidates any in-flight replay's async completion and its
+    // pending identity record: the old replay must not write back into (or
+    // restore state for) the new turn.
+    this.turnEpoch.set(sessionID, (this.turnEpoch.get(sessionID) ?? 0) + 1);
+    this.pendingReplay.delete(sessionID);
 
     // Un-sealing a stage-2 abort is stricter: only a turn that returns to the
     // configured primary model re-opens the chain. A fallback-model turn (or a
@@ -2052,6 +2079,10 @@ export class ForegroundFallbackManager {
     // Register this replay's identity BEFORE the prompt: the host may emit the
     // replay's own user message even after promptAsync returns (inProgress
     // already cleared), and that event must not be mistaken for a real turn.
+    // The turn epoch captured here fences the async completion: if a genuine
+    // new turn resets the session while this replay is in flight, the replay
+    // must not write model/switch state back into it.
+    const replayEpoch = this.turnEpoch.get(sessionID) ?? 0;
     this.pendingReplay.set(sessionID, {
       targetModel,
       baselineMessageID,
@@ -2179,8 +2210,15 @@ export class ForegroundFallbackManager {
         { sessionID, agentName, from: fromModel, intended: targetModel },
       );
     } else if (isModelSwitch) {
-      this.sessionModel.set(sessionID, targetModel);
-      this.onSessionModelChanged?.(sessionID, targetModel);
+      if ((this.turnEpoch.get(sessionID) ?? 0) === replayEpoch) {
+        this.sessionModel.set(sessionID, targetModel);
+        this.onSessionModelChanged?.(sessionID, targetModel);
+      } else {
+        log(
+          '[foreground-fallback] fallback switch superseded by a newer turn; model claim skipped',
+          { sessionID, intended: targetModel },
+        );
+      }
     }
     // Admission accepted (with or without the switch): convert the
     // prepared handoff into a tracked run (register + immediate probe)
@@ -2190,7 +2228,11 @@ export class ForegroundFallbackManager {
     if (handoffArmed) {
       this.backgroundFallbackHandoff?.admit(sessionID, preparedGeneration);
     }
-    if (isModelSwitch && !deliveredWithoutSwitch) {
+    if (
+      isModelSwitch &&
+      !deliveredWithoutSwitch &&
+      (this.turnEpoch.get(sessionID) ?? 0) === replayEpoch
+    ) {
       log('[foreground-fallback] switched to fallback model', {
         sessionID,
         agentName,

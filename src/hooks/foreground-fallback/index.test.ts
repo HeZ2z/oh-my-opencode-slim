@@ -6764,6 +6764,135 @@ describe('ForegroundFallbackManager retry budget', () => {
     expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
   });
 
+  test('a real turn during an in-flight same-model retry resets the budget', async () => {
+    const sessionID = 'sess-concurrent-absorb';
+    let resolvePrompt!: (value: unknown) => void;
+    const promptGate = new Promise((resolve) => {
+      resolvePrompt = resolve;
+    });
+    let reads = 0;
+    createMockClient({
+      messagesImpl: async () => {
+        reads += 1;
+        const base = [
+          {
+            info: { id: 'u1', role: 'user' },
+            parts: [{ type: 'text', text: 'hello' }],
+          },
+        ];
+        // The replay's own read does not yet see the concurrent user turn.
+        if (reads === 1) return { data: base };
+        return {
+          data: [
+            ...base,
+            {
+              info: { id: 'user-turn-2', role: 'user' },
+              parts: [{ type: 'text', text: 'second' }],
+            },
+          ],
+        };
+      },
+      promptAsyncImpl: () => promptGate,
+    });
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+    );
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    const retry = mgr.handleEvent(errorEvent(sessionID)); // absorbed → same-model retry
+    expect(mgr.isFallbackInProgress(sessionID)).toBe(true);
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+
+    // A genuine external user turn arrives while the replay is in flight and
+    // must get its own fresh fallback state.
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          id: 'user-turn-2',
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-b' },
+        },
+      },
+    });
+    expect((mgr as any).sessionRetries.has(sessionID)).toBe(false);
+    expect((mgr as any).sessionTried.has(sessionID)).toBe(false);
+
+    resolvePrompt({});
+    await retry;
+  });
+
+  test('an in-flight fallback cannot claim a switch after a newer turn', async () => {
+    const sessionID = 'sess-concurrent-switch';
+    let resolvePrompt!: (value: unknown) => void;
+    const promptGate = new Promise((resolve) => {
+      resolvePrompt = resolve;
+    });
+    let reads = 0;
+    const onChanged = mock(() => {});
+    createMockClient({
+      messagesImpl: async () => {
+        reads += 1;
+        const base = [
+          {
+            info: { id: 'u1', role: 'user' },
+            parts: [{ type: 'text', text: 'hello' }],
+          },
+        ];
+        if (reads === 1) return { data: base };
+        return {
+          data: [
+            ...base,
+            {
+              info: { id: 'user-turn-2', role: 'user' },
+              parts: [{ type: 'text', text: 'second' }],
+            },
+          ],
+        };
+      },
+      promptAsyncImpl: () => promptGate,
+    });
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      { directory: '/test' } as any,
+      0,
+      undefined,
+      onChanged,
+      0,
+      0,
+    );
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    const fallback = mgr.handleEvent(errorEvent(sessionID)); // fallback → replay (hangs)
+    expect(mgr.isFallbackInProgress(sessionID)).toBe(true);
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          id: 'user-turn-2',
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-b' },
+        },
+      },
+    });
+
+    resolvePrompt({});
+    await fallback;
+
+    // The superseded replay must not claim the switch for the new turn.
+    expect((mgr as any).sessionModel.get(sessionID)).toBe('openai/gpt-b');
+    expect(onChanged).not.toHaveBeenCalled();
+  });
+
   // ===========================================================================
   // Terminal absorb tests (new semantics)
   // ===========================================================================
