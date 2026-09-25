@@ -169,6 +169,28 @@ const PROVIDER_OUTAGE_PATTERNS = [
   /\bstatus.?410\b/i,
 ];
 
+// Usage/quota exhaustion that a retry of the same model cannot recover from:
+// deterministic for the current provider/account, so the chain should advance
+// immediately. Deliberately narrower than the general failover classifier —
+// ordinary 429s, short-term "quota threshold" and generic "usage
+// limit/exceeded" wording keep using the configured same-model retry budget.
+const PERMANENT_USAGE_QUOTA_PATTERNS = [
+  // Explicit account / billing limits.
+  /\bpersonal-team-blocked\b/i,
+  /\bspending.?limit\b/i,
+  /\bran\s+out\s+of\s+credits\b/i,
+  /\bcoding plan package has expired\b/i,
+  // Explicit "limit reached/exhausted" wording for a fixed billing window.
+  /\b(?:monthly|weekly)\s+(?:usage\s+)?limit\s+(?:reached|exhausted)\b/i,
+  // Explicit exhausted quota/usage (not a threshold).
+  /\b(?:usage|quota)\s+(?:has been\s+)?(?:exhausted|depleted)\b/i,
+  // Provider-specific permanent billing codes.
+  /"1113"/,
+  /"1308"/,
+  /"1309"/,
+  /"1310"/,
+];
+
 /** Accept only plausible HTTP status codes so an arbitrary numeric field
  *  (token counts, ports, retry numbers) is never mistaken for one. */
 function asHttpStatus(value: unknown): number | undefined {
@@ -365,6 +387,39 @@ export function isFailoverError(error: unknown): boolean {
   }
 
   return verdict;
+}
+
+function failoverErrorText(error: unknown): string {
+  if (typeof error === 'string') return error;
+  if (!isRecord(error)) return '';
+  const data = isRecord(error.data) ? error.data : undefined;
+  return [
+    typeof error.message === 'string' ? error.message : '',
+    typeof data?.message === 'string' ? data.message : '',
+    typeof data?.responseBody === 'string' ? data.responseBody : '',
+  ].join(' ');
+}
+
+/**
+ * Usage/quota errors should advance the chain immediately. A billing status
+ * (402) is permanent even when the provider omits a descriptive message.
+ */
+function isPermanentUsageQuotaError(error: unknown): boolean {
+  if (!error) return false;
+  if (typeof error === 'object' && error !== null) {
+    const statusCode = extractStatusCode(
+      error as {
+        statusCode?: unknown;
+        status?: unknown;
+        data?: unknown;
+        cause?: unknown;
+        response?: unknown;
+      },
+    );
+    if (statusCode === 402) return true;
+  }
+  const text = failoverErrorText(error);
+  return PERMANENT_USAGE_QUOTA_PATTERNS.some((pattern) => pattern.test(text));
 }
 
 const INLINE_STATUS_CODES = new Set([401, 410]);
@@ -777,7 +832,7 @@ export class ForegroundFallbackManager {
             const incidentId =
               typeof info.id === 'string' && info.id ? info.id : undefined;
             if (!this.isTerminalIncidentDeduped(sessionID, incidentId)) {
-              const d = this.decideIntervention(sessionID, false);
+              const d = this.decideIntervention(sessionID, false, info.error);
               if (d === 'absorb') {
                 await this.retryCurrentModel(sessionID, info.error);
               } else if (d === 'fallback') {
@@ -824,7 +879,7 @@ export class ForegroundFallbackManager {
             // next real failure).
             const incidentId = this.stableEventIncidentId(props);
             if (!this.isTerminalIncidentDeduped(sessionID, incidentId)) {
-              const d = this.decideIntervention(sessionID, false);
+              const d = this.decideIntervention(sessionID, false, props.error);
               if (d === 'absorb') {
                 await this.retryCurrentModel(sessionID, props.error);
               } else if (d === 'fallback') {
@@ -855,6 +910,10 @@ export class ForegroundFallbackManager {
             (props.status.message !== undefined &&
               isFailoverError({ message: props.status.message })));
         if (isFailoverRetry) {
+          const retryError =
+            props.error && isFailoverError(props.error)
+              ? props.error
+              : { message: props.status?.message ?? '' };
           // Guard: stale retry event from a previous model's retry loop.
           // After a fallback, lastTriggerModel holds the OLD model (anchored
           // by isHostRetryDeduped before the fallback), while sessionModel
@@ -883,16 +942,13 @@ export class ForegroundFallbackManager {
           if (this.isExhausted(sessionID)) break;
           if (this.inProgress.has(sessionID)) break;
           if (this.isHostRetryDeduped(sessionID, attempt)) break;
-          const d = this.decideIntervention(sessionID, true);
+          const d = this.decideIntervention(sessionID, true, retryError);
           if (d === 'fallback') {
             // Failover may have been detected from status.message (e.g.
             // 'AI_APICallError: Gone') with no separate error property;
             // forward that message so 401/410 inline errors suppress the
             // toast on this path too, matching session.error behavior.
-            await this.tryFallbackWithAbort(
-              sessionID,
-              props.error ?? { message: props.status?.message ?? '' },
-            );
+            await this.tryFallbackWithAbort(sessionID, retryError);
           }
           // absorb/fallback-delayed → no-op
           break;
@@ -999,7 +1055,7 @@ export class ForegroundFallbackManager {
         return;
       if (event.agent) this.registerSessionAgent(sessionID, event.agent);
       this.sessionModel.set(sessionID, from);
-      const selected = this.selectFallbackModel(sessionID);
+      const selected = this.selectFallbackModel(sessionID, event.error);
       if (!selected || selected === 'exhausted') return;
       const { agentName, nextModel, ref } = selected;
       picked = nextModel;
@@ -1095,9 +1151,21 @@ export class ForegroundFallbackManager {
   private decideIntervention(
     sessionID: string,
     needsAbort = false,
+    error?: unknown,
   ): 'absorb' | 'fallback' | 'fallback-delayed' {
-    if (!this.consumeRetryBudget(sessionID)) {
+    const permanentUsageQuota = isPermanentUsageQuotaError(error);
+    if (!permanentUsageQuota && !this.consumeRetryBudget(sessionID)) {
       return 'absorb';
+    }
+    if (permanentUsageQuota) {
+      log('[foreground-fallback] permanent usage/quota failure', {
+        sessionID,
+        needsAbort,
+      });
+      // A confirmed permanent quota/billing failure must advance the chain
+      // immediately: initialRetryDelayMs exists to give intercepting plugins
+      // time to recover a transient fault, never a permanent one.
+      return 'fallback';
     }
     if (this.initialRetryDelayMs > 0) {
       if (this.pendingInitialDelay.has(sessionID)) {
@@ -1118,8 +1186,8 @@ export class ForegroundFallbackManager {
           // and swallowed, never escape as an unhandled rejection.
           // Call tryFallbackWithAbort for session.status retry path
           const trigger = needsAbort
-            ? this.tryFallbackWithAbort(sessionID)
-            : this.tryFallback(sessionID);
+            ? this.tryFallbackWithAbort(sessionID, error)
+            : this.tryFallback(sessionID, error);
           void trigger.catch((err) => {
             log('[foreground-fallback] delayed fallback trigger failed', {
               sessionID,
@@ -1282,26 +1350,39 @@ export class ForegroundFallbackManager {
     return (this.chainExhaustion.get(sessionID) ?? 0) >= 2;
   }
 
-  /** Clear stage-2 exhaustion and the spent retry budget/episode when a fresh
-   *  user turn returns the session to the chain primary, so recovery is never
-   *  permanently sealed and the new turn earns the configured retry budget. */
+  /** A confirmed new user turn always starts a fresh retry budget/episode and
+   *  cancels any pending initial-delay trigger. Stage-2 terminal recovery
+   *  additionally requires the turn to return to the configured primary. */
   private freshTurnResetHandler(
     sessionID: string,
     newModel: string | undefined,
   ): void {
-    if ((this.chainExhaustion.get(sessionID) ?? 0) !== 2) return;
-    const agentName = this.sessionAgent.get(sessionID);
-    if (!agentName) return;
-    const chain = this.chains[agentName];
-    if (!chain || chain.length === 0) return;
-    if (newModel !== undefined && newModel !== chain[0]) return;
-    this.chainExhaustion.delete(sessionID);
-    // The new turn re-sends the configured primary, so the spent budget and
-    // the retry episode reset too: the first failure of the new turn gets the
-    // full configured current-model retries again before falling back.
+    // Budget / episode / delay reset applies to ANY confirmed user turn: the
+    // previous descent's spent budget must not carry into the new request.
+    const pendingDelay = this.pendingInitialDelay.get(sessionID);
+    if (pendingDelay) {
+      clearTimeout(pendingDelay);
+      this.pendingInitialDelay.delete(sessionID);
+    }
+    this.sessionTried.delete(sessionID);
     this.sessionRetries.delete(sessionID);
     this.initialDelayScheduled.delete(sessionID);
     this.retryEpisode.delete(sessionID);
+    this.lastTrigger.delete(sessionID);
+    this.lastTriggerModel.delete(sessionID);
+    this.lastTriggerMap.delete(sessionID);
+    this.lastFallbackTime.delete(sessionID);
+
+    // Un-sealing a stage-2 abort is stricter: only a turn that returns to the
+    // configured primary model re-opens the chain. A fallback-model turn (or a
+    // user event without model info) resets the budget but not the terminal
+    // guard.
+    if ((this.chainExhaustion.get(sessionID) ?? 0) !== 2) return;
+    if (newModel === undefined) return;
+    const agentName = this.sessionAgent.get(sessionID);
+    const primary = agentName ? this.chains[agentName]?.[0] : undefined;
+    if (primary === undefined || newModel !== primary) return;
+    this.chainExhaustion.delete(sessionID);
     log('[foreground-fallback] fresh turn reset from stage-2', {
       sessionID,
       agentName,
@@ -1416,24 +1497,13 @@ export class ForegroundFallbackManager {
     return false;
   }
 
-  private selectFallbackModel(sessionID: string) {
+  private selectFallbackModel(sessionID: string, error?: unknown) {
     const observedModel = this.sessionModel.get(sessionID);
     let currentModel = observedModel;
     const agentName = this.sessionAgent.get(sessionID);
     const chain = this.resolveChain(agentName, currentModel);
     // Callers pre-check via hasFallbackChain; keep as defensive guard only.
     if (!chain.length) return;
-    // The CONFIGURED chain head, not resolveChain's resolved head: a combined
-    // inherit+chain session prepends its live model as a dynamic head that
-    // by construction always equals observedModel, so comparing against
-    // chain[0] there would re-arm every error and ping-pong the descent
-    // (reset → re-descend → exhaust → reset again). Only an observed return
-    // to the configured primary re-arms. Unknown agents resolve a static
-    // chain, where chain[0] already is the configured head.
-    const configuredChain =
-      agentName === undefined ? undefined : this.chains[agentName];
-    const rearmHead = configuredChain?.[0] ?? chain[0];
-
     // When the agent is known but no model was captured (common for
     // subagent error events that fire before message.updated), infer
     // the current model as the chain's first entry. Without this, the
@@ -1449,43 +1519,6 @@ export class ForegroundFallbackManager {
     // biome-ignore lint/style/noNonNullAssertion: We just set this above
     let tried = this.sessionTried.get(sessionID)!;
 
-    // A new user turn always re-sends the agent's configured primary:
-    // promptAsync's `model` is a per-message override, so a fallback never
-    // persists past the message it was applied to. Landing here on the
-    // configured primary (rearmHead) with a tried set that already walked
-    // past it therefore means the previous descent has ended and its state
-    // is stale. Without this the next descent resumes one link deeper every
-    // turn (link 2, then 3, then 4...) until the chain is spent and the
-    // session aborts, instead of re-walking from link 2 each turn.
-    //
-    // This does not weaken the backward-fallback guard below: currentModel
-    // is re-added immediately after, so the re-arm head still can never be
-    // picked. Only an OBSERVED configured primary counts. execFallback
-    // infers `currentModel = chain[0]` above when no model was ever
-    // captured for this session, which is the opposite situation —
-    // resetting there would re-pick chain[1] on every error instead of
-    // descending.
-    // size > 1 means a previous descent actually selected a fallback
-    // (tried.add(nextModel) below), so there is stale state to clear. A
-    // single-entry chain never gets there and must stay terminal after its
-    // one abort rather than re-aborting on every error.
-    if (
-      observedModel !== undefined &&
-      observedModel === rearmHead &&
-      tried.size > 1
-    ) {
-      tried = new Set();
-      this.sessionTried.set(sessionID, tried);
-      // A descent that ended in a stage-2 abort is never followed by a
-      // successful assistant message, so the message.updated recovery path
-      // cannot clear chainExhaustion and fallback would stay disabled for
-      // the rest of the session. A fresh descent earns a fresh chance.
-      this.chainExhaustion.delete(sessionID);
-      this.sessionRetries.delete(sessionID);
-      this.initialDelayScheduled.delete(sessionID);
-      this.retryEpisode.delete(sessionID);
-    }
-
     // After the chain has been exhausted twice (reset retry failed and we
     // aborted), do not intervene again for this session: re-entering would
     // keep aborting in a loop. Surface errors to the user instead.
@@ -1500,7 +1533,7 @@ export class ForegroundFallbackManager {
 
     let nextModel = chain.find((m) => !tried.has(m));
     if (!nextModel) {
-      if (chain.length > 1) {
+      if (chain.length > 1 && !isPermanentUsageQuotaError(error)) {
         // Chain exhausted but we have fallbacks: on the first exhaustion
         // reset the tried set and stick to the deepest fallback model so
         // we stop re-trying the dead primary model on every subsequent
@@ -1572,7 +1605,7 @@ export class ForegroundFallbackManager {
     // even read the transcript through the old client.
     if (this.abandonedByDispose(sessionID)) return;
     try {
-      const selection = this.selectFallbackModel(sessionID);
+      const selection = this.selectFallbackModel(sessionID, error);
       if (!selection) return;
       if (selection === 'exhausted') {
         // Same withhold as the retry and busy paths: the merged chain

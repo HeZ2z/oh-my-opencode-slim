@@ -3396,9 +3396,11 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
           info: {
             sessionID,
             agent: 'orchestrator',
-            role: 'assistant',
-            providerID: 'anthropic',
-            modelID: 'claude-opus-4-5',
+            role: 'user',
+            model: {
+              providerID: 'anthropic',
+              modelID: 'claude-opus-4-5',
+            },
           },
         },
       });
@@ -5805,6 +5807,302 @@ describe('ForegroundFallbackManager retry budget', () => {
       providerID: 'openai',
       modelID: 'gpt-c',
     });
+  });
+
+  test('permanent usage limits skip same-model retries even with budget remaining', async () => {
+    const { mocks, mgr } = createBudgetManager(3);
+    const sessionID = 'sess-permanent-usage';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID,
+        error: { message: 'Monthly usage limit reached. Resets tomorrow.' },
+      },
+    });
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-c',
+    });
+    expect((mgr as any).sessionRetries.get(sessionID)).toBeUndefined();
+  });
+
+  test('permanent usage limits walk the chain without sticky re-fallback', async () => {
+    const { mocks } = createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      {
+        orchestrator: ['openai/gpt-b', 'openai/gpt-c', 'openai/gpt-d'],
+      },
+      true,
+      { directory: '/test' } as any,
+      3,
+      undefined,
+      undefined,
+      0,
+      0,
+    );
+    const sessionID = 'sess-permanent-chain';
+    const permanentError = {
+      message: 'Your quota has been exhausted for this billing period.',
+    };
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: { sessionID, error: permanentError },
+    });
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: { sessionID, error: permanentError },
+    });
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: { sessionID, error: permanentError },
+    });
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+    expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-c',
+    });
+    expect(mocks.promptAsync.mock.calls[1]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-d',
+    });
+    expect(mocks.abort).toHaveBeenCalledTimes(1);
+  });
+
+  test('a confirmed primary user turn resets descent state before the next error', async () => {
+    const { mocks, mgr } = createBudgetManager(2);
+    const sessionID = 'sess-primary-turn-reset';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-b' },
+        },
+      },
+    });
+
+    expect((mgr as any).sessionRetries.get(sessionID)).toBeUndefined();
+    expect((mgr as any).sessionTried.get(sessionID)).toBeUndefined();
+
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+    expect(mocks.promptAsync.mock.calls[1]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-b',
+    });
+  });
+
+  test('initial delayed fallback preserves the original inline error', async () => {
+    const { mocks } = createMockClient();
+    const showToast = mock(async () => ({}));
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      {
+        directory: '/test',
+        client: { tui: { showToast } },
+      } as any,
+      0,
+      undefined,
+      undefined,
+      20,
+      0,
+    );
+    const sessionID = 'sess-delayed-original-error';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID,
+        error: { statusCode: 410, message: 'Gone' },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-c',
+    });
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  test('session.status retry with a permanent usage error aborts and switches', async () => {
+    const { mocks, mgr } = createBudgetManager(3);
+    const sessionID = 'sess-permanent-status';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent({
+      type: 'session.status',
+      properties: {
+        sessionID,
+        status: {
+          type: 'retry',
+          attempt: 1,
+          message: 'Monthly usage limit reached',
+        },
+      },
+    });
+
+    // Permanent: abort the retry loop, switch immediately, no budget charge.
+    expect(mocks.abort).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-c',
+    });
+    expect((mgr as any).sessionRetries.get(sessionID)).toBeUndefined();
+  });
+
+  test('a permanent quota error bypasses the initial retry delay', async () => {
+    const { mocks, mgr } = createBudgetManager(3, 500); // delay configured, budget to spare
+    const sessionID = 'sess-permanent-no-delay';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID,
+        error: { message: 'Monthly usage limit reached.' },
+      },
+    });
+
+    // Immediate fallback: no delayed trigger queued, no same-model retry.
+    expect((mgr as any).pendingInitialDelay.size).toBe(0);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-c',
+    });
+  });
+
+  test('an ordinary 429 still uses the initial retry delay', async () => {
+    const { mocks, mgr } = createBudgetManager(0, 40);
+    const sessionID = 'sess-429-initial-delay';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID,
+        error: { statusCode: 429, message: 'Rate limit exceeded' },
+      },
+    });
+
+    // Transient: the first fallback is deferred by initialRetryDelayMs.
+    expect((mgr as any).pendingInitialDelay.size).toBe(1);
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('a confirmed new user turn cancels a pending initial delay', async () => {
+    const { mocks, mgr } = createBudgetManager(1, 40);
+    const sessionID = 'sess-cancel-delay';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent(errorEvent(sessionID)); // absorbed → same-model retry
+    await mgr.handleEvent(errorEvent(sessionID)); // budget spent → schedules delay
+    expect((mgr as any).pendingInitialDelay.size).toBe(1);
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-b' },
+        },
+      },
+    });
+    expect((mgr as any).pendingInitialDelay.size).toBe(0);
+
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    // The cancelled timer never fired a fallback for the old descent.
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('a delayed fallback with the original 429 still shows the toast', async () => {
+    const showToast = mock(async () => ({}));
+    createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      { directory: '/test', client: { tui: { showToast } } } as any,
+      0,
+      undefined,
+      undefined,
+      20,
+      0,
+    );
+    const sessionID = 'sess-delay-toast-429';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID,
+        error: { statusCode: 429, message: 'Rate limit exceeded' },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    expect(showToast).toHaveBeenCalledTimes(1);
+  });
+
+  test("the fallback's own replay user message does not reset the descent", async () => {
+    let mgr!: ForegroundFallbackManager;
+    const sessionID = 'sess-replay-reset-guard';
+    createMockClient({
+      promptAsyncImpl: async () => {
+        // The replayed prompt makes the host emit a user message while the
+        // fallback is still in flight; it must not reset the budget.
+        await mgr.handleEvent({
+          type: 'message.updated',
+          properties: {
+            info: {
+              sessionID,
+              agent: 'orchestrator',
+              role: 'user',
+              model: { providerID: 'openai', modelID: 'gpt-b' },
+            },
+          },
+        });
+        return {};
+      },
+    });
+    mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      undefined,
+      0,
+      0,
+    );
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent(errorEvent(sessionID)); // absorbed → same-model retry
+
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
   });
 
   // ===========================================================================

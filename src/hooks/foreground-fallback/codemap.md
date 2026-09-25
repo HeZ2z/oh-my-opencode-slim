@@ -41,8 +41,9 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
 - `maxRetries = N` absorbs failures `1..N` on the current model; failure `N+1` (and every later failure) advances the chain. `maxRetries = 0` switches immediately.
 - The budget is **chain-global** and is not cleared on a model switch.
 - Cleared only on: a completed successful assistant response, `session.deleted`, or a confirmed new user turn.
+- **Permanent usage/quota failures** (`isPermanentUsageQuotaError`: 402, explicit spending / personal-team-blocked limits, "coding plan package has expired", fixed-window limit reached/exhausted, explicit quota exhausted, provider billing codes) skip the budget entirely — no same-model replay — and never take the sticky re-fallback; `execFallback` aborts at stage 2 when the chain is spent. Ordinary 429 / rate-limit / short-term "quota threshold" wording keeps using the configured budget.
 - `isExhausted` (stage 2) short-circuits every failover event and both `tryFallback`/`tryFallbackWithAbort`, so a spent chain aborts at most once.
-- `freshTurnResetHandler` clears stage 2 **and** the spent budget/episode when a confirmed new `user` turn (SDK `UserMessage` nests the model under `info.model`; assistant messages keep it top-level) returns to `chain[0]`. A late assistant-role primary event is not a new turn and does not reset.
+- `freshTurnResetHandler` runs on any confirmed new `user` turn (the SDK `UserMessage` nests the model under `info.model`; assistant messages keep it top-level; our own in-flight replay is excluded via `inProgress`): it cancels a pending initial-delay trigger and clears the budget, retry episode, `sessionTried`, dedup anchors and `lastFallbackTime`. Un-sealing the stage-2 terminal guard additionally requires the turn to return to `chain[0]`.
 
 ### Deduplication (identity-based)
 - No error-text + time-window heuristic: identical text can be the next real failure.
