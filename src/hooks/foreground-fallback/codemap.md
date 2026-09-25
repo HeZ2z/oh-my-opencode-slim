@@ -23,6 +23,7 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
   - `lastTriggerMap`: identity-based dedup keys → timestamps
   - `retryEpisode`: per-session `session.status` retry episode (model, episode id, seen attempts)
   - `initialDelayScheduled` / `pendingInitialDelay`: one initial-delay trigger per descent
+  - `pendingReplay`: identity of a just-issued internal replay (target model, baseline message id, admitted flag, window) so the replay's own user message, even when it arrives after `promptAsync` returned, is not mistaken for a real new turn
   - `inProgress`: process-global Set of sessions with an active retry/fallback, shared via `globalThis` + `Symbol.for`
 
 ### Decision Function
@@ -43,7 +44,7 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
 - Cleared only on: a completed successful assistant response, `session.deleted`, or a confirmed new user turn.
 - **Permanent usage/quota failures** (`isPermanentUsageQuotaError`: 402, explicit spending / personal-team-blocked limits, "coding plan package has expired", fixed-window limit reached/exhausted, explicit quota exhausted, provider billing codes) skip the budget entirely — no same-model replay — and never take the sticky re-fallback; `execFallback` aborts at stage 2 when the chain is spent. Ordinary 429 / rate-limit / short-term "quota threshold" wording keeps using the configured budget.
 - `isExhausted` (stage 2) short-circuits every failover event and both `tryFallback`/`tryFallbackWithAbort`, so a spent chain aborts at most once.
-- `freshTurnResetHandler` runs on any confirmed new `user` turn (the SDK `UserMessage` nests the model under `info.model`; assistant messages keep it top-level; our own in-flight replay is excluded via `inProgress`): it cancels a pending initial-delay trigger and clears the budget, retry episode, `sessionTried`, dedup anchors and `lastFallbackTime`. Un-sealing the stage-2 terminal guard additionally requires the turn to return to `chain[0]`.
+- `freshTurnResetHandler` runs on any confirmed new `user` turn (the SDK `UserMessage` nests the model under `info.model`; assistant messages keep it top-level): it cancels a pending initial-delay trigger and clears the budget, retry episode, `sessionTried`, dedup anchors and `lastFallbackTime`. A user message is only treated as a real turn when it is NOT inside our own in-flight replay and NOT positively identified as a replay message (`handleUserTurn`: baseline message id match, or an internal-initiator part confirmed from the transcript tail). Un-sealing the stage-2 terminal guard additionally requires the turn to return to `chain[0]`.
 
 ### Deduplication (identity-based)
 - No error-text + time-window heuristic: identical text can be the next real failure.

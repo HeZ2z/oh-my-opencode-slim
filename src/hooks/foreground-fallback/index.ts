@@ -20,7 +20,12 @@
 import type { PluginInput } from '@opencode-ai/plugin';
 import { responseError, stringifyError } from '../../utils/child-transcript';
 import { isRecord } from '../../utils/guards';
-import { createInternalAgentTextPart } from '../../utils/internal-initiator';
+import {
+  createInternalAgentTextPart,
+  INTERNAL_INITIATOR_METADATA_KEY,
+  isInternalInitiatorPart,
+  SLIM_INTERNAL_INITIATOR_MARKER,
+} from '../../utils/internal-initiator';
 import { log } from '../../utils/logger';
 import { getClient } from '../../utils/opencode-client';
 import {
@@ -306,6 +311,24 @@ function messageModel(info: {
   return undefined;
 }
 
+/** Message id for both shapes: v1 nests it under `info.id`; the v2 flat
+ *  `session.messages()` shape carries a top-level `id`. */
+function messageID(message: unknown): string | undefined {
+  if (!isRecord(message)) return undefined;
+  const info = message.info;
+  if (isRecord(info) && typeof info.id === 'string' && info.id) return info.id;
+  if (typeof message.id === 'string' && message.id) return message.id;
+  return undefined;
+}
+
+/** The internal-initiator marker survives the v2 text-only translation as the
+ *  trailing comment appended by `createInternalAgentTextPart`. */
+function hasInternalMarkerText(value: unknown): boolean {
+  return (
+    typeof value === 'string' && value.includes(SLIM_INTERNAL_INITIATOR_MARKER)
+  );
+}
+
 export function isFailoverError(error: unknown): boolean {
   if (!error) return false;
   if (typeof error === 'string') {
@@ -476,6 +499,8 @@ const DEDUP_WINDOW_MS = 5_000;
 const REPROMPT_DELAY_MS = 500;
 /** Ceiling on host calls: a hung transport must not stall fallback. */
 const HOST_CALL_TIMEOUT_MS = 2_000;
+/** Late replay user event identity lifetime. */
+const REPLAY_IDENTITY_WINDOW_MS = 30_000;
 /** Transcript tail size for the fallback replay read: the replay only needs
  *  the last replayable user message plus the trailing message id (handoff
  *  baseline), never the full history. */
@@ -565,6 +590,20 @@ export class ForegroundFallbackManager {
     }
   >();
   private retryEpisodeSeq = 0;
+  /** sessionID → identity of a just-issued internal replay. The host may emit
+   *  the replay's own user message after promptAsync returned (inProgress
+   *  already cleared); this lets us recognise it and NOT treat it as a real
+   *  new user turn. Cleared on success, failure, session deletion, dispose or
+   *  message-id confirmation. */
+  private readonly pendingReplay = new Map<
+    string,
+    {
+      targetModel: string;
+      baselineMessageID: string | undefined;
+      startedAt: number;
+      admitted: boolean;
+    }
+  >();
   /** True once dispose() ran. `opencode reload` destroys this instance's
    *  context mid-attempt; in-flight fallback chains check this at every
    *  suspension point so their continuation never touches the old
@@ -667,6 +706,7 @@ export class ForegroundFallbackManager {
       clearTimeout(handle);
     }
     this.pendingInitialDelay.clear();
+    this.pendingReplay.clear();
   }
 
   /** Dispose fence for fallback chains: true when this generation was
@@ -805,13 +845,17 @@ export class ForegroundFallbackManager {
           this.sessionModel.set(sessionID, observedModel);
         }
         // A confirmed new USER turn earns recovery: it clears stage-2
-        // exhaustion and starts a fresh retry budget/episode. Guard on
-        // in-progress so our own fallback replay (which re-sends the user
-        // parts through promptAsync) cannot reset the state mid-descent. A
-        // late primary event from the old request is assistant-role and never
-        // reaches here.
-        if (info.role === 'user' && !this.inProgress.has(sessionID)) {
-          this.freshTurnResetHandler(sessionID, observedModel);
+        // exhaustion and starts a fresh retry budget/episode. Identity, not
+        // just `!inProgress`, decides whether this is a real external turn —
+        // our own replay's user message can arrive late, after inProgress was
+        // cleared. A late primary event from the old request is assistant-role
+        // and never reaches here.
+        if (info.role === 'user') {
+          await this.handleUserTurn(
+            sessionID,
+            typeof info.id === 'string' && info.id ? info.id : undefined,
+            observedModel,
+          );
         }
         const messageTime = info.time;
         const isCompletedSuccessfulAssistant =
@@ -1015,6 +1059,7 @@ export class ForegroundFallbackManager {
             clearTimeout(pendingDelay);
             this.pendingInitialDelay.delete(id);
           }
+          this.pendingReplay.delete(id);
         }
         break;
       }
@@ -1350,6 +1395,86 @@ export class ForegroundFallbackManager {
     return (this.chainExhaustion.get(sessionID) ?? 0) >= 2;
   }
 
+  /** Decide whether a user message is a real external turn. Our own fallback
+   *  replay re-sends the user parts with an internal-initiator marker and the
+   *  host may emit that message after promptAsync returned; such an event must
+   *  not reset the descent. */
+  private async handleUserTurn(
+    sessionID: string,
+    messageId: string | undefined,
+    model: string | undefined,
+  ): Promise<void> {
+    // Still inside our own replay (promptAsync has not returned yet).
+    if (this.inProgress.has(sessionID)) return;
+
+    const pending = this.pendingReplay.get(sessionID);
+    if (pending) {
+      const expired =
+        Date.now() - pending.startedAt > REPLAY_IDENTITY_WINDOW_MS;
+      if (!expired && messageId !== undefined) {
+        if (messageId === pending.baselineMessageID) {
+          // Re-emission of a message we already knew about — not a new turn.
+          return;
+        }
+        if (await this.isInternalReplayMessage(sessionID, messageId)) {
+          // Our own replay message, possibly delivered after the prompt
+          // returned. Keep the descent state.
+          this.pendingReplay.delete(sessionID);
+          return;
+        }
+      }
+      // Anything we cannot positively identify as our replay is a real turn.
+      this.pendingReplay.delete(sessionID);
+    }
+    this.freshTurnResetHandler(sessionID, model);
+  }
+
+  /** Confirm a user message carries the internal-initiator marker we attach to
+   *  fallback replays. Reads only the transcript tail. */
+  private async isInternalReplayMessage(
+    sessionID: string,
+    messageId: string,
+  ): Promise<boolean> {
+    try {
+      const session = getClient(this.input).session;
+      const result = await session.messages({
+        path: { id: sessionID },
+        query: { limit: FALLBACK_REPLAY_TAIL_MESSAGES },
+      });
+      const messages = (result.data ?? []) as unknown[];
+      const target = [...messages]
+        .reverse()
+        .find((m) => messageID(m) === messageId);
+      if (!isRecord(target)) return false;
+
+      // v1: part-level synthetic metadata (or a text part carrying the marker).
+      if (Array.isArray(target.parts)) {
+        const parts = target.parts;
+        if (
+          parts.some(
+            (part) =>
+              isInternalInitiatorPart(part) ||
+              (isRecord(part) && hasInternalMarkerText(part.text)),
+          )
+        ) {
+          return true;
+        }
+      }
+      // v2 flat shape: the marker survives as joined text (the shim appends
+      // the marker comment to the part text) and/or message-level metadata.
+      if (hasInternalMarkerText(target.text)) return true;
+      if (
+        isRecord(target.metadata) &&
+        target.metadata[INTERNAL_INITIATOR_METADATA_KEY] === true
+      ) {
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
   /** A confirmed new user turn always starts a fresh retry budget/episode and
    *  cancels any pending initial-delay trigger. Stage-2 terminal recovery
    *  additionally requires the turn to return to the configured primary. */
@@ -1625,6 +1750,7 @@ export class ForegroundFallbackManager {
         error,
       );
     } catch (err) {
+      this.pendingReplay.delete(sessionID);
       log('[foreground-fallback] fallback attempt failed', {
         sessionID,
         error: stringifyError(err),
@@ -1796,18 +1922,17 @@ export class ForegroundFallbackManager {
     // but has no delivery owner yet. Baseline = trailing message WITH
     // a string id from the transcript read that produced the replay,
     // so the substituted run's answer is always post-baseline.
+    // Baseline = trailing message with a string id (v1 `info.id` or the v2
+    // flat top-level `id`) from the read that produced the replay.
     const baselineMessageID = [...messages]
       .reverse()
-      .find(
-        (m) =>
-          isRecord(m) &&
-          typeof (m as { info?: { id?: unknown } }).info?.id === 'string',
-      ) as { info: { id: string } } | undefined;
+      .map((m) => messageID(m))
+      .find((id) => id !== undefined);
     const handoffArmed =
       this.backgroundFallbackHandoff?.prepare(
         sessionID,
         preparedGeneration,
-        baselineMessageID?.info?.id,
+        baselineMessageID,
       ) ?? false;
     // Distinguish "not applicable" (foreground or unmanaged session —
     // preparedGeneration undefined, the fallback proceeds) from "was
@@ -1835,6 +1960,15 @@ export class ForegroundFallbackManager {
         );
       }
     };
+    // Register this replay's identity BEFORE the prompt: the host may emit the
+    // replay's own user message even after promptAsync returns (inProgress
+    // already cleared), and that event must not be mistaken for a real turn.
+    this.pendingReplay.set(sessionID, {
+      targetModel,
+      baselineMessageID,
+      startedAt: Date.now(),
+      admitted: false,
+    });
     let promptResult: unknown;
     try {
       promptResult = await promptAsync(promptBody);
@@ -1852,6 +1986,7 @@ export class ForegroundFallbackManager {
         // admitted, so release ownership (reject) like the v2 branch
         // above instead of converting into a tracked run.
         withdrawHandoff();
+        this.pendingReplay.delete(sessionID);
         throw promptErr;
       }
       log('[foreground-fallback] promptAsync on busy session, aborting', {
@@ -1860,7 +1995,10 @@ export class ForegroundFallbackManager {
       });
       await this.promoteForegroundWaiter(sessionID);
       // Same stale-generation fence as the failover abort above.
-      if (this.abandonedByDispose(sessionID)) return;
+      if (this.abandonedByDispose(sessionID)) {
+        this.pendingReplay.delete(sessionID);
+        return;
+      }
       if (this.withholdsAbortForLiveChildren(sessionID)) {
         // Explicit busy refusal with no abort attempted: nothing was
         // admitted, so release ownership (reject) like the v2 branch
@@ -1882,6 +2020,7 @@ export class ForegroundFallbackManager {
             abortErr instanceof Error ? abortErr.message : String(abortErr),
         });
         settleUnresolvedHandoff();
+        this.pendingReplay.delete(sessionID);
         return;
       }
       await new Promise((r) => setTimeout(r, REPROMPT_DELAY_MS));
@@ -1889,6 +2028,7 @@ export class ForegroundFallbackManager {
       // second replay must not go through the old client.
       if (this.abandonedByDispose(sessionID)) {
         settleUnresolvedHandoff();
+        this.pendingReplay.delete(sessionID);
         return;
       }
       try {
@@ -1905,6 +2045,7 @@ export class ForegroundFallbackManager {
             retryErr instanceof Error ? retryErr.message : String(retryErr),
         });
         settleUnresolvedHandoff();
+        this.pendingReplay.delete(sessionID);
         return;
       }
     }
@@ -1923,7 +2064,15 @@ export class ForegroundFallbackManager {
         },
       );
       withdrawHandoff();
+      this.pendingReplay.delete(sessionID);
       return;
+    }
+
+    // Admission accepted (real switch or same-model replay): keep the replay
+    // identity available so a late user message event can still be matched.
+    const replayState = this.pendingReplay.get(sessionID);
+    if (replayState) {
+      replayState.admitted = true;
     }
 
     // v2 shim: `switched: false` means the replay WAS DELIVERED on
@@ -2000,6 +2149,7 @@ export class ForegroundFallbackManager {
         error,
       );
     } catch (err) {
+      this.pendingReplay.delete(sessionID);
       log('[foreground-fallback] retry prompt failed', {
         sessionID,
         targetModel: this.sessionModel.get(sessionID) ?? 'unknown',

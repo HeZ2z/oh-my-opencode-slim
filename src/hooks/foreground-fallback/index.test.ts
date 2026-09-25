@@ -6105,6 +6105,294 @@ describe('ForegroundFallbackManager retry budget', () => {
     expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
   });
 
+  test('a delayed internal replay user event does not reset the retry budget', async () => {
+    const sessionID = 'sess-delayed-replay';
+    const replayMessageId = 'replay-msg-1';
+    const baseMessages = [
+      {
+        info: { id: 'u1', role: 'user' },
+        parts: [{ type: 'text', text: 'hello' }],
+      },
+    ];
+    let reads = 0;
+    const { mocks } = createMockClient({
+      messagesImpl: async () => {
+        reads += 1;
+        // First read = the replay's own tail transcript (replay message not
+        // persisted yet); later reads include the persisted replay message.
+        if (reads === 1) return { data: baseMessages };
+        return {
+          data: [
+            ...baseMessages,
+            {
+              info: { id: replayMessageId, role: 'user' },
+              parts: [
+                {
+                  type: 'text',
+                  text: 'hello\n<!-- SLIM_INTERNAL_INITIATOR -->',
+                  synthetic: true,
+                  metadata: { 'oh-my-opencode-slim.internalInitiator': true },
+                },
+              ],
+            },
+          ],
+        };
+      },
+    });
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      undefined,
+      0,
+      0,
+    );
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent(errorEvent(sessionID)); // absorbed → replay registered
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+
+    // The replay's own user message arrives AFTER promptAsync returned.
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          id: replayMessageId,
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-b' },
+        },
+      },
+    });
+
+    // Identified as our replay: the budget survives.
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+
+    // The next failure continues the SAME budget → exhausted → fallback.
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+    expect(mocks.promptAsync.mock.calls[1]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-c',
+    });
+  });
+
+  test('a genuinely new user message id resets the retry budget', async () => {
+    const { mgr } = createBudgetManager(2);
+    const sessionID = 'sess-new-user-id';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent(errorEvent(sessionID)); // absorbed → replay registered
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          id: 'fresh-user-msg',
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-b' },
+        },
+      },
+    });
+
+    expect((mgr as any).sessionRetries.get(sessionID)).toBeUndefined();
+  });
+
+  test('session deletion clears the replay identity', async () => {
+    const { mgr } = createBudgetManager(1);
+    const sessionID = 'sess-replay-delete';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect((mgr as any).pendingReplay.has(sessionID)).toBe(true);
+
+    await mgr.handleEvent({
+      type: 'session.deleted',
+      properties: { info: { id: sessionID } },
+    });
+
+    expect((mgr as any).pendingReplay.has(sessionID)).toBe(false);
+  });
+
+  test('dispose clears the replay identity', async () => {
+    const { mgr } = createBudgetManager(1);
+    const sessionID = 'sess-replay-dispose';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect((mgr as any).pendingReplay.has(sessionID)).toBe(true);
+
+    mgr.dispose();
+
+    expect((mgr as any).pendingReplay.size).toBe(0);
+  });
+
+  test('a failed replay leaves no identity that blocks a later real turn', async () => {
+    createMockClient({
+      promptAsyncImpl: async () => {
+        throw new Error('transport failed');
+      },
+      abortImpl: async () => {
+        throw new Error('abort failed');
+      },
+    });
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      undefined,
+      0,
+      0,
+    );
+    const sessionID = 'sess-replay-failure';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent(errorEvent(sessionID)); // replay fails → identity cleared
+    expect((mgr as any).pendingReplay.has(sessionID)).toBe(false);
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          id: 'later-user',
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-b' },
+        },
+      },
+    });
+    expect((mgr as any).sessionRetries.get(sessionID)).toBeUndefined();
+  });
+
+  test('a delayed v2 replay user event does not reset the retry budget', async () => {
+    const sessionID = 'sess-v2-delayed-replay';
+    const replayMessageId = 'replay-msg-1';
+    const v2Base = { id: 'u1', type: 'user', text: 'hello' };
+    let reads = 0;
+    const { mocks } = createMockClient({
+      messagesImpl: async () => {
+        reads += 1;
+        if (reads === 1) return { data: [v2Base] };
+        return {
+          data: [
+            v2Base,
+            {
+              id: replayMessageId,
+              type: 'user',
+              text: 'hello\n<!-- SLIM_INTERNAL_INITIATOR -->',
+            },
+          ],
+        };
+      },
+    });
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      undefined,
+      0,
+      0,
+    );
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent(errorEvent(sessionID)); // absorbed → replay registered
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+
+    // The v2 replay message (flat id/text) arrives after promptAsync returned.
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          id: replayMessageId,
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-b' },
+        },
+      },
+    });
+
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+    expect(mocks.promptAsync.mock.calls[1]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-c',
+    });
+  });
+
+  test('a genuinely new v2 user message resets the retry budget', async () => {
+    const { mgr } = createBudgetManager(2);
+    const sessionID = 'sess-v2-new-user';
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent(errorEvent(sessionID)); // absorbed → replay registered
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          id: 'v2-fresh-user',
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-b' },
+        },
+      },
+    });
+
+    expect((mgr as any).sessionRetries.get(sessionID)).toBeUndefined();
+  });
+
+  test('the transcript baseline reads the v2 top-level id', async () => {
+    const sessionID = 'sess-v2-baseline';
+    const v2Base = { id: 'baseline-1', type: 'user', text: 'hello' };
+    createMockClient({ messagesImpl: async () => ({ data: [v2Base] }) });
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      undefined,
+      0,
+      0,
+    );
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent(errorEvent(sessionID)); // replay → baseline = 'baseline-1'
+
+    // A re-emission of the baseline message (same id) is not a new turn: this
+    // only holds if the baseline was read from the v2 top-level id.
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          id: 'baseline-1',
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-b' },
+        },
+      },
+    });
+
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+  });
+
   // ===========================================================================
   // Terminal absorb tests (new semantics)
   // ===========================================================================
