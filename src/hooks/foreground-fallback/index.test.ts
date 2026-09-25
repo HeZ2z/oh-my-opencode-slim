@@ -6729,6 +6729,41 @@ describe('ForegroundFallbackManager retry budget', () => {
     expect((mgr as any).v2RetryTerminal.size).toBe(0);
   });
 
+  test('a late confirmed replay notification does not overwrite the active model', async () => {
+    createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+    );
+    const sessionID = 'sess-late-replay-model';
+    (mgr as any).sessionModel.set(sessionID, 'openai/gpt-c');
+    (mgr as any).sessionRetries.set(sessionID, 1);
+    (mgr as any).replayMessageIds.set(sessionID, new Set(['replay-1']));
+
+    const notify = () =>
+      mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID,
+            id: 'replay-1',
+            agent: 'orchestrator',
+            role: 'user',
+            // The replay's older model (A); the session has since moved to B.
+            model: { providerID: 'openai', modelID: 'gpt-b' },
+          },
+        },
+      });
+
+    await notify();
+    await notify(); // duplicate notification
+
+    expect((mgr as any).sessionModel.get(sessionID)).toBe('openai/gpt-c');
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+  });
+
   // ===========================================================================
   // Terminal absorb tests (new semantics)
   // ===========================================================================

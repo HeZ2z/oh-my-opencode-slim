@@ -855,21 +855,17 @@ export class ForegroundFallbackManager {
         // carry providerID/modelID at the top level; user messages (the SDK
         // UserMessage shape) nest them under info.model.
         const observedModel = messageModel(info);
-        if (observedModel !== undefined) {
-          this.sessionModel.set(sessionID, observedModel);
-        }
-        // A confirmed new USER turn earns recovery: it clears stage-2
-        // exhaustion and starts a fresh retry budget/episode. Identity, not
-        // just `!inProgress`, decides whether this is a real external turn —
-        // our own replay's user message can arrive late, after inProgress was
-        // cleared. A late primary event from the old request is assistant-role
-        // and never reaches here.
+        const messageId =
+          typeof info.id === 'string' && info.id ? info.id : undefined;
         if (info.role === 'user') {
-          await this.handleUserTurn(
-            sessionID,
-            typeof info.id === 'string' && info.id ? info.id : undefined,
-            observedModel,
-          );
+          // A user message is either our own internal replay or a real new
+          // turn. Decide identity BEFORE writing any state: a late replay
+          // notification must not overwrite the active model or reset the
+          // descent. `handleUserTurn` performs the model write/reset only for a
+          // confirmed external turn.
+          await this.handleUserTurn(sessionID, messageId, observedModel);
+        } else if (observedModel !== undefined) {
+          this.sessionModel.set(sessionID, observedModel);
         }
         const messageTime = info.time;
         const isCompletedSuccessfulAssistant =
@@ -1454,16 +1450,33 @@ export class ForegroundFallbackManager {
     messageId: string | undefined,
     model: string | undefined,
   ): Promise<void> {
+    // Nothing is written until the message is confirmed to be a real external
+    // turn: a late internal replay notification must not overwrite the active
+    // model or reset the descent.
+    if (await this.isInternalReplayUserMessage(sessionID, messageId)) return;
+    if (model !== undefined) {
+      this.sessionModel.set(sessionID, model);
+    }
+    this.freshTurnResetHandler(sessionID, model);
+  }
+
+  /** Whether a user message is our own internal replay rather than a real new
+   *  turn. Retention/identity is checked before anything else so a late replay
+   *  event cannot clobber the current model or reset the budget. */
+  private async isInternalReplayUserMessage(
+    sessionID: string,
+    messageId: string | undefined,
+  ): Promise<boolean> {
     // A message id already confirmed as our own replay stays internal for the
     // session: late or repeated notifications must not reset the budget.
     if (
       messageId !== undefined &&
       this.replayMessageIds.get(sessionID)?.has(messageId)
     ) {
-      return;
+      return true;
     }
     // Still inside our own replay (promptAsync has not returned yet).
-    if (this.inProgress.has(sessionID)) return;
+    if (this.inProgress.has(sessionID)) return true;
 
     const pending = this.pendingReplay.get(sessionID);
     if (pending) {
@@ -1472,7 +1485,7 @@ export class ForegroundFallbackManager {
       if (!expired && messageId !== undefined) {
         if (messageId === pending.baselineMessageID) {
           // Re-emission of a message we already knew about — not a new turn.
-          return;
+          return true;
         }
         if (await this.isInternalReplayMessage(sessionID, messageId)) {
           // Our own replay message, possibly delivered after the prompt
@@ -1483,7 +1496,7 @@ export class ForegroundFallbackManager {
           if (this.pendingReplay.get(sessionID) === pending) {
             this.pendingReplay.delete(sessionID);
           }
-          return;
+          return true;
         }
       }
       // Anything we cannot positively identify as our replay is a real turn.
@@ -1491,7 +1504,7 @@ export class ForegroundFallbackManager {
         this.pendingReplay.delete(sessionID);
       }
     }
-    this.freshTurnResetHandler(sessionID, model);
+    return false;
   }
 
   /** Retain a user message id confirmed as our own internal replay. */
