@@ -15,6 +15,7 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
 
 ### Core Abstraction
 - **ForegroundFallbackManager**: Class instantiated at plugin initialization; process-local fallback progress is shared across replacement instances
+- On v2 hosts (`hostFlavor === 'v2'`) the manager is constructed **disabled** (`enabled=false`) even when `fallback.enabled !== false`, with one deterministic startup log: the v2 `switchModel` has no per-turn/atomic conditional form, so an in-flight switch could commit after a newer user turn took over. Host-native retries and their decisions are untouched; the whole manager is gated because `session.error`, `message.updated` and `session.status` retry all reach the replay path, not just the retry hook. v1 is unchanged.
 - Per-session state:
   - `sessionModel` / `sessionAgent` / `sessionTried`: current model, agent name, models already attempted
   - `sessionRetries`: chain-global count of absorbed current-model retries (not reset by a model switch)
