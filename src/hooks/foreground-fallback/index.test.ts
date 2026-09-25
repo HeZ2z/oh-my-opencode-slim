@@ -363,6 +363,97 @@ describe('ForegroundFallbackManager v2 retry hook', () => {
     expect(switchModel).not.toHaveBeenCalled();
     expect(event.decision).toBe(decision);
   });
+
+  test('an ordinary exhausted v2 chain becomes terminal for the session', async () => {
+    createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['test/A'] },
+      true,
+      { directory: '/test' } as any,
+      0,
+    );
+    const sid = 'retry-ordinary-terminal';
+    const switchModel = mock(async () => {});
+
+    const first = { ...retryEvent(sid, 'A'), decision: { retry: true } };
+    await mgr.handleV2Retry(first, switchModel);
+    expect(switchModel).not.toHaveBeenCalled();
+    expect(first.decision).toEqual({ retry: false });
+    expect((mgr as any).v2RetryTerminal.has(sid)).toBe(true);
+
+    // Subsequent calls keep answering `{ retry: false }`.
+    const second = { ...retryEvent(sid, 'A'), decision: { retry: true } };
+    await mgr.handleV2Retry(second, switchModel);
+    expect(second.decision).toEqual({ retry: false });
+    expect(switchModel).not.toHaveBeenCalled();
+  });
+
+  test('the first ordinary v2 exhaustion still takes the sticky retry', async () => {
+    createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['test/A', 'test/B'] },
+      true,
+      { directory: '/test' } as any,
+      0,
+    );
+    const sid = 'retry-sticky-then-terminal';
+    const switchModel = mock(async () => {});
+
+    const first = { ...retryEvent(sid, 'A'), decision: { retry: true } };
+    await mgr.handleV2Retry(first, switchModel);
+    expect(first.decision).toEqual({ retry: true, delay: 500 }); // A → B
+
+    // First exhaustion: sticky re-fallback, still retryable.
+    const second = { ...retryEvent(sid, 'B'), decision: { retry: true } };
+    await mgr.handleV2Retry(second, switchModel);
+    expect(second.decision).toEqual({ retry: true, delay: 500 });
+
+    // Second exhaustion: terminal.
+    const third = { ...retryEvent(sid, 'B'), decision: { retry: true } };
+    await mgr.handleV2Retry(third, switchModel);
+    expect(third.decision).toEqual({ retry: false });
+  });
+
+  test('recovery clears the v2 terminal so the chain can advance again', async () => {
+    createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['test/A', 'test/B'] },
+      true,
+      { directory: '/test' } as any,
+      0,
+    );
+    const sid = 'retry-terminal-recover';
+    const switchModel = mock(async () => {});
+
+    const first = { ...retryEvent(sid, 'A'), decision: { retry: true } };
+    await mgr.handleV2Retry(first, switchModel);
+    const second = { ...retryEvent(sid, 'B'), decision: { retry: true } };
+    await mgr.handleV2Retry(second, switchModel);
+    const third = { ...retryEvent(sid, 'B'), decision: { retry: true } };
+    await mgr.handleV2Retry(third, switchModel);
+    expect(third.decision).toEqual({ retry: false });
+    expect((mgr as any).v2RetryTerminal.has(sid)).toBe(true);
+
+    // A completed successful assistant response clears the terminal (with 2).
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: sid,
+          agent: 'orchestrator',
+          role: 'assistant',
+          time: { created: 1, completed: 2 },
+        },
+      },
+    });
+    expect((mgr as any).v2RetryTerminal.has(sid)).toBe(false);
+
+    // The next ordinary failure is evaluated normally again: a stale terminal
+    // would have forced `{ retry: false }` instead of advancing the chain.
+    const later = { ...retryEvent(sid, 'A'), decision: { retry: true } };
+    await mgr.handleV2Retry(later, switchModel);
+    expect(later.decision).toEqual({ retry: true, delay: 500 });
+  });
 });
 
 // ---------------------------------------------------------------------------

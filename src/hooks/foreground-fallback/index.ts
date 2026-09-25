@@ -1107,9 +1107,11 @@ export class ForegroundFallbackManager {
       const { sessionID } = event;
       if (!this.enabled || this.disposed || this.inProgress.has(sessionID))
         return;
-      // Terminal from a prior permanent-quota exhaustion: the host must not
-      // retry this session again until a genuine new turn reopens the chain.
-      if (this.v2RetryTerminal.has(sessionID)) {
+      // Terminal once the chain is spent — ordinary or permanent quota: the
+      // host must not keep retrying a session the fallback manager considers
+      // exhausted. Cleared by a completed success, a primary-model new turn,
+      // session deletion or dispose (kept in lock-step with stage 2).
+      if (this.isExhausted(sessionID) || this.v2RetryTerminal.has(sessionID)) {
         event.decision = { retry: false };
         return;
       }
@@ -1130,7 +1132,6 @@ export class ForegroundFallbackManager {
         return;
       if (event.agent) this.registerSessionAgent(sessionID, event.agent);
       this.sessionModel.set(sessionID, from);
-      if (this.isExhausted(sessionID)) return;
       if (!this.hasFallbackChain(sessionID)) return;
       if (
         !isPermanentUsageQuotaError(event.error) &&
@@ -1138,20 +1139,18 @@ export class ForegroundFallbackManager {
       )
         return;
       const selected = this.selectFallbackModel(sessionID, event.error);
-      if (!selected || selected === 'exhausted') {
-        if (
-          selected === 'exhausted' &&
-          isPermanentUsageQuotaError(event.error)
-        ) {
-          // Permanent quota/billing exhaustion is terminal for this session:
-          // tell the host not to retry, and keep answering that way.
-          this.v2RetryTerminal.add(sessionID);
-          event.decision = { retry: false };
-          log(
-            '[foreground-fallback] v2 retry hook terminal: permanent quota exhausted',
-            { sessionID },
-          );
-        }
+      if (!selected) return;
+      if (selected === 'exhausted') {
+        // The chain reached stage 2 (ordinary or permanent): terminal for this
+        // session — tell the host not to retry and keep answering that way. A
+        // first ordinary exhaustion already took the sticky re-fallback via
+        // `selectFallbackModel` above; only the second lands here.
+        this.v2RetryTerminal.add(sessionID);
+        event.decision = { retry: false };
+        log(
+          '[foreground-fallback] v2 retry hook terminal: retry budget exhausted',
+          { sessionID },
+        );
         return;
       }
       const { agentName, nextModel, ref } = selected;
