@@ -7548,6 +7548,96 @@ describe('ForegroundFallbackManager retry budget', () => {
     });
   });
 
+  test('a superseded fallback does not record lastFallbackTime or delay the next turn', async () => {
+    jest.useFakeTimers();
+    try {
+      const sessionID = 'sess-superseded-last-fallback';
+      const base = [
+        {
+          info: { id: 'u1', role: 'user' },
+          parts: [{ type: 'text', text: 'hello' }],
+        },
+      ];
+      const persistedNewTurn = {
+        info: { id: 'new-user-turn', role: 'user' },
+        parts: [{ type: 'text', text: 'a genuinely new turn' }],
+      };
+      let reads = 0;
+      let releaseTail!: (value: unknown) => void;
+      const tailGate = new Promise((resolve) => {
+        releaseTail = resolve;
+      });
+      const { mocks } = createMockClient({
+        messagesImpl: async () => {
+          reads += 1;
+          // #1 = the first fallback's transcript read (suspended). Later reads
+          // (the new turn's probe and the next fallback's tail) see the new turn.
+          if (reads === 1) return tailGate;
+          return { data: [...base, persistedNewTurn] };
+        },
+      });
+      const mgr = new ForegroundFallbackManager(
+        {
+          orchestrator: [
+            'openai/gpt-b',
+            'openai/gpt-c',
+            'openai/gpt-d',
+            'openai/gpt-e',
+          ],
+        },
+        true,
+        { directory: '/test' } as any,
+        0, // maxRetries=0 → the first error falls back
+        undefined,
+        undefined,
+        0, // initialRetryDelayMs
+        1000, // retryDelayMs — a superseded attempt must not record this backoff
+      );
+
+      await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+
+      // Start a fallback; its transcript read hangs inside execFallback.
+      const fallback = mgr.handleEvent(errorEvent(sessionID));
+
+      // A genuine new user turn moves the session to gpt-d (bumping the epoch)
+      // while execFallback is suspended.
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID,
+            id: 'new-user-turn',
+            agent: 'orchestrator',
+            role: 'user',
+            model: { providerID: 'openai', modelID: 'gpt-d' },
+          },
+        },
+      });
+      expect((mgr as any).sessionModel.get(sessionID)).toBe('openai/gpt-d');
+
+      // Release the read: the superseded attempt aborts without sending.
+      releaseTail({ data: base });
+      await fallback;
+
+      expect(mocks.promptAsync).not.toHaveBeenCalled();
+      // The cancelled attempt must not have recorded the backoff anchor.
+      expect((mgr as any).lastFallbackTime.has(sessionID)).toBe(false);
+
+      // The new turn's next fallback must not inherit the 1000ms backoff: it
+      // reaches promptAsync without any timer advance.
+      const next = mgr.handleEvent(errorEvent(sessionID));
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+        providerID: 'openai',
+        modelID: 'gpt-e',
+      });
+      await next;
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   // ===========================================================================
   // Terminal absorb tests (new semantics)
   // ===========================================================================

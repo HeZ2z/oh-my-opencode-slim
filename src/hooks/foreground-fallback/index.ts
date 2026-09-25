@@ -1394,7 +1394,16 @@ export class ForegroundFallbackManager {
       }
 
       await this.execFallback(sessionID, error, entryEpoch);
-      this.lastFallbackTime.set(sessionID, Date.now());
+      // Record the backoff anchor only when this attempt still belongs to the
+      // current turn. A superseded attempt (new user turn started while
+      // execFallback was suspended) sends no request and must not delay the
+      // new turn's next fallback with an inherited retryDelayMs sleep.
+      if (
+        !this.abandonedByDispose(sessionID) &&
+        (this.turnEpoch.get(sessionID) ?? 0) === entryEpoch
+      ) {
+        this.lastFallbackTime.set(sessionID, Date.now());
+      }
     } finally {
       this.inProgress.delete(sessionID);
     }
