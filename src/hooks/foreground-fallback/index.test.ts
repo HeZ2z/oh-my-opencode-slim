@@ -454,6 +454,170 @@ describe('ForegroundFallbackManager v2 retry hook', () => {
     await mgr.handleV2Retry(later, switchModel);
     expect(later.decision).toEqual({ retry: true, delay: 500 });
   });
+
+  test('a v2 retry switch resolving after a newer turn is superseded', async () => {
+    createMockClient();
+    const onChanged = mock(() => {});
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['test/A', 'test/B', 'test/C', 'test/D'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      onChanged,
+      0,
+      0,
+    );
+    const sid = 'retry-v2-superseded';
+    // Budget already spent so the first event starts the A → B switch.
+    (mgr as any).sessionRetries.set(sid, 1);
+
+    const { promise: switchRequest, resolve: resolveSwitch } =
+      Promise.withResolvers<void>();
+    const decisionRef = { retry: true, delay: 9999 };
+    const event = retryEvent(sid, 'A', decisionRef);
+    const pending = mgr.handleV2Retry(event, () => switchRequest);
+
+    // A genuine new user turn moves the session to C while the switch is in
+    // flight.
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: sid,
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'test', modelID: 'C' },
+        },
+      },
+    });
+    expect((mgr as any).sessionModel.get(sid)).toBe('test/C');
+    expect((mgr as any).sessionRetries.get(sid)).toBeUndefined();
+
+    resolveSwitch();
+    await pending;
+
+    // The stale hook must not write B, notify, or overwrite the host decision.
+    expect((mgr as any).sessionModel.get(sid)).toBe('test/C');
+    expect(onChanged).not.toHaveBeenCalled();
+    expect(event.decision).toBe(decisionRef);
+
+    // The next failure uses C on the new turn's fresh budget: the first event
+    // is absorbed (no switch), the second advances from C.
+    const switchModel2 = mock(async () => {});
+    await mgr.handleV2Retry(
+      retryEvent(sid, 'C', { retry: true }),
+      switchModel2,
+    );
+    expect((mgr as any).sessionRetries.get(sid)).toBe(1);
+    expect(switchModel2).not.toHaveBeenCalled();
+    await mgr.handleV2Retry(
+      retryEvent(sid, 'C', { retry: true }),
+      switchModel2,
+    );
+    expect(switchModel2).toHaveBeenCalledWith(sid, {
+      providerID: 'test',
+      id: 'D',
+    });
+  });
+
+  test('a late-landing v2 switch cannot reconcile into a newer turn (different model)', async () => {
+    jest.useFakeTimers();
+    try {
+      const observed: string[] = [];
+      const mgr = retryMgr(
+        ['A', 'B', 'C'],
+        (_sid, model) => void observed.push(model),
+      );
+      const sid = 'retry-v2-late-different';
+      const { promise: switchRequest, resolve: resolveSwitch } =
+        Promise.withResolvers<void>();
+      const decisionRef = { retry: true };
+      const event = retryEvent(sid, 'A', decisionRef);
+      const pending = mgr.handleV2Retry(event, () => switchRequest);
+      jest.advanceTimersByTime(2_500);
+      await pending;
+      expect(observed).toEqual([]);
+      expect(event.decision).toBe(decisionRef);
+
+      // A genuine new turn moves the session to C before the timed-out switch
+      // lands.
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID: sid,
+            agent: 'orchestrator',
+            role: 'user',
+            model: { providerID: 'test', modelID: 'C' },
+          },
+        },
+      });
+      expect((mgr as any).sessionModel.get(sid)).toBe('test/C');
+
+      resolveSwitch();
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+
+      // No reconcile: B must not be written or notified into the newer turn.
+      expect((mgr as any).sessionModel.get(sid)).toBe('test/C');
+      expect(observed).toEqual([]);
+
+      // The next failure is evaluated normally (fresh turn budget).
+      const follow = retryEvent(sid, 'C', { retry: true });
+      await mgr.handleV2Retry(
+        follow,
+        mock(async () => {}),
+      );
+      expect(follow.decision).toEqual({ retry: true, delay: 500 });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('a late-landing v2 switch cannot reconcile into a newer turn on the same model', async () => {
+    jest.useFakeTimers();
+    try {
+      const observed: string[] = [];
+      const mgr = retryMgr(
+        ['A', 'B'],
+        (_sid, model) => void observed.push(model),
+      );
+      const sid = 'retry-v2-late-same';
+      const { promise: switchRequest, resolve: resolveSwitch } =
+        Promise.withResolvers<void>();
+      const event = retryEvent(sid, 'A', { retry: true });
+      const pending = mgr.handleV2Retry(event, () => switchRequest);
+      jest.advanceTimersByTime(2_500);
+      await pending;
+      expect(observed).toEqual([]);
+
+      // A genuine new turn returns the session to the SAME model A: the
+      // sessionModel guard alone would pass, but the epoch must still fence
+      // the late B.
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID: sid,
+            agent: 'orchestrator',
+            role: 'user',
+            model: { providerID: 'test', modelID: 'A' },
+          },
+        },
+      });
+      expect((mgr as any).sessionModel.get(sid)).toBe('test/A');
+      expect((mgr as any).turnEpoch.get(sid)).toBe(1);
+
+      resolveSwitch();
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+
+      // The epoch check must stop the reconcile from writing B / notifying.
+      expect((mgr as any).sessionModel.get(sid)).toBe('test/A');
+      expect(observed).toEqual([]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -5827,8 +5991,12 @@ describe('ForegroundFallbackManager retry budget', () => {
     };
   }
 
-  function createBudgetManager(maxRetries: number, initialRetryDelayMs = 0) {
-    const { mocks } = createMockClient();
+  function createBudgetManager(
+    maxRetries: number,
+    initialRetryDelayMs = 0,
+    clientOverrides?: Parameters<typeof createMockClient>[0],
+  ) {
+    const { mocks } = createMockClient(clientOverrides);
     const mgr = new ForegroundFallbackManager(
       { orchestrator: ['openai/gpt-b', 'openai/gpt-c', 'openai/gpt-d'] },
       true,
@@ -6436,8 +6604,31 @@ describe('ForegroundFallbackManager retry budget', () => {
   });
 
   test('a genuinely new user message id resets the retry budget', async () => {
-    const { mgr } = createBudgetManager(2);
     const sessionID = 'sess-new-user-id';
+    const base = [
+      {
+        info: { id: 'u1', role: 'user' },
+        parts: [{ type: 'text', text: 'hello' }],
+      },
+    ];
+    let reads = 0;
+    const { mgr } = createBudgetManager(2, 0, {
+      messagesImpl: async () => {
+        reads += 1;
+        // The replay's tail read sees only the prior turn; the host persists
+        // the new user message before its event fires.
+        if (reads === 1) return { data: base };
+        return {
+          data: [
+            ...base,
+            {
+              info: { id: 'fresh-user-msg', role: 'user' },
+              parts: [{ type: 'text', text: 'a fresh turn' }],
+            },
+          ],
+        };
+      },
+    });
 
     await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
     await mgr.handleEvent(errorEvent(sessionID)); // absorbed → replay registered
@@ -6589,8 +6780,23 @@ describe('ForegroundFallbackManager retry budget', () => {
   });
 
   test('a genuinely new v2 user message resets the retry budget', async () => {
-    const { mgr } = createBudgetManager(2);
     const sessionID = 'sess-v2-new-user';
+    const v2Base = { id: 'u1', type: 'user', text: 'hello' };
+    let reads = 0;
+    const { mgr } = createBudgetManager(2, 0, {
+      messagesImpl: async () => {
+        reads += 1;
+        // The replay's tail read sees only the prior turn; the host persists
+        // the new user message before its event fires.
+        if (reads === 1) return { data: [v2Base] };
+        return {
+          data: [
+            v2Base,
+            { id: 'v2-fresh-user', type: 'user', text: 'a fresh turn' },
+          ],
+        };
+      },
+    });
 
     await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
     await mgr.handleEvent(errorEvent(sessionID)); // absorbed → replay registered
@@ -6982,6 +7188,364 @@ describe('ForegroundFallbackManager retry budget', () => {
     // The superseded replay must not claim the switch for the new turn.
     expect((mgr as any).sessionModel.get(sessionID)).toBe('openai/gpt-b');
     expect(onChanged).not.toHaveBeenCalled();
+  });
+
+  test('the replay epoch is captured before the transcript read', async () => {
+    const sessionID = 'sess-replay-epoch-before-read';
+    let releaseTail!: (value: unknown) => void;
+    const tailGate = new Promise((resolve) => {
+      releaseTail = resolve;
+    });
+    let reads = 0;
+    const onChanged = mock(() => {});
+    const { mocks } = createMockClient({
+      messagesImpl: async () => {
+        reads += 1;
+        // Call #1 = the suspended fallback replay tail read. Later calls = the
+        // new turn's identity probe, which sees the persisted new turn.
+        if (reads === 1) return tailGate;
+        return {
+          data: [
+            {
+              info: { id: 'new-user-turn', role: 'user' },
+              parts: [{ type: 'text', text: 'a genuinely new turn' }],
+            },
+          ],
+        };
+      },
+    });
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c', 'openai/gpt-d'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      onChanged,
+      0,
+      0,
+    );
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+
+    // Suspend a fallback replay (switch claim) on its transcript read.
+    const staleReplay = (mgr as any).replayFallbackPrompt(
+      sessionID,
+      'openai/gpt-c',
+      'openai/gpt-b',
+      true,
+      undefined,
+    );
+
+    // A genuine new user turn arrives while the read is suspended: it is
+    // persisted and the session model moves to gpt-d.
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          id: 'new-user-turn',
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-d' },
+        },
+      },
+    });
+    expect((mgr as any).sessionModel.get(sessionID)).toBe('openai/gpt-d');
+    expect((mgr as any).sessionRetries.get(sessionID)).toBeUndefined();
+
+    // The transcript read now resolves with the OLD transcript.
+    releaseTail({
+      data: [
+        {
+          info: { id: 'u1', role: 'user' },
+          parts: [{ type: 'text', text: 'old turn' }],
+        },
+      ],
+    });
+    await staleReplay;
+
+    // The stale replay must not send, claim the switch, or migrate state.
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+    expect((mgr as any).sessionModel.get(sessionID)).toBe('openai/gpt-d');
+    expect(onChanged).not.toHaveBeenCalled();
+
+    // The next failure still uses the new turn's model on a fresh budget.
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-d',
+    });
+  });
+
+  test('a late replay notification stays internal after a new turn supersedes it', async () => {
+    const sessionID = 'sess-late-replay-after-new-turn';
+    const replayMessageId = 'late-replay-msg';
+    const base = [
+      {
+        info: { id: 'u1', role: 'user' },
+        parts: [{ type: 'text', text: 'hello' }],
+      },
+    ];
+    const persistedNewTurn = {
+      info: { id: 'new-user-turn', role: 'user' },
+      parts: [{ type: 'text', text: 'a genuinely new turn' }],
+    };
+    let reads = 0;
+    const { mgr } = createBudgetManager(1, 0, {
+      messagesImpl: async () => {
+        reads += 1;
+        // #1 = the replay's tail read: only the prior turn.
+        if (reads === 1) return { data: base };
+        // #2 = new-turn probe: the new turn is persisted (external).
+        // #3 = late replay probe: the replay's own message is NOT persisted
+        //      yet (unknown), so only the retained record can recognise it.
+        return { data: [...base, persistedNewTurn] };
+      },
+    });
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent(errorEvent(sessionID)); // absorbed → replay completes
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+    expect((mgr as any).pendingReplay.has(sessionID)).toBe(true);
+
+    // A genuine new turn arrives after the replay's prompt returned.
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          id: 'new-user-turn',
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-d' },
+        },
+      },
+    });
+    expect((mgr as any).sessionModel.get(sessionID)).toBe('openai/gpt-d');
+    expect((mgr as any).sessionRetries.get(sessionID)).toBeUndefined();
+    const epochAfterNewTurn = (mgr as any).turnEpoch.get(sessionID);
+    // The unconfirmed record survives the new turn so the late replay can
+    // still be recognised.
+    expect((mgr as any).pendingReplay.has(sessionID)).toBe(true);
+
+    // The replay's own user message notification arrives late, for the first
+    // time, and is not persisted yet (unknown identity).
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          id: replayMessageId,
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-b' },
+        },
+      },
+    });
+
+    // Recognised as internal: model, budget and epoch all survive.
+    expect((mgr as any).sessionModel.get(sessionID)).toBe('openai/gpt-d');
+    expect((mgr as any).sessionRetries.get(sessionID)).toBeUndefined();
+    expect((mgr as any).turnEpoch.get(sessionID)).toBe(epochAfterNewTurn);
+
+    // The next failure uses the new turn's model on a fresh budget.
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect((mgr as any).sessionModel.get(sessionID)).toBe('openai/gpt-d');
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+  });
+
+  test('a fallback suspended on the abort is superseded by a newer turn', async () => {
+    const sessionID = 'sess-abort-superseded';
+    let releaseAbort!: (value: unknown) => void;
+    const abortGate = new Promise((resolve) => {
+      releaseAbort = resolve;
+    });
+    let reads = 0;
+    const onChanged = mock(() => {});
+    const { mocks } = createMockClient({
+      abortImpl: () => abortGate,
+      messagesImpl: async () => {
+        reads += 1;
+        const base = [
+          {
+            info: { id: 'u1', role: 'user' },
+            parts: [{ type: 'text', text: 'hello' }],
+          },
+        ];
+        // #1 = the first absorb's replay tail. #2 = the new-turn probe; #3 =
+        // the next failure's replay tail. Both see the persisted new turn.
+        if (reads === 1) return { data: base };
+        return {
+          data: [
+            ...base,
+            {
+              info: { id: 'new-user-turn', role: 'user' },
+              parts: [{ type: 'text', text: 'new turn' }],
+            },
+          ],
+        };
+      },
+    });
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c', 'openai/gpt-d'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      onChanged,
+      0,
+      0,
+    );
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    // Error #1 absorbed on gpt-b → same-model replay (promptAsync call #1).
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+
+    // Budget spent → the session.status retry path aborts, then falls back.
+    const fallback = mgr.handleEvent({
+      type: 'session.status',
+      properties: {
+        sessionID,
+        status: {
+          type: 'retry',
+          attempt: 1,
+          message: 'rate limit, retrying...',
+        },
+      },
+    });
+    // Let the promotion await settle so the abort is actually issued; it then
+    // suspends on the deferred abortImpl.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mocks.abort).toHaveBeenCalledTimes(1);
+
+    // A genuine new user turn arrives while the abort is suspended.
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          id: 'new-user-turn',
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-d' },
+        },
+      },
+    });
+    expect((mgr as any).sessionModel.get(sessionID)).toBe('openai/gpt-d');
+    expect((mgr as any).sessionRetries.get(sessionID)).toBeUndefined();
+
+    // Release the abort: the stale fallback must not switch to gpt-c or replay.
+    releaseAbort({});
+    await fallback;
+
+    expect((mgr as any).sessionModel.get(sessionID)).toBe('openai/gpt-d');
+    expect(onChanged).not.toHaveBeenCalled();
+    // Only the pre-abort absorb's replay reached promptAsync.
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+
+    // The next failure uses the new turn's model on a fresh budget.
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect((mgr as any).sessionModel.get(sessionID)).toBe('openai/gpt-d');
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+    expect(mocks.promptAsync.mock.calls[1]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-d',
+    });
+  });
+
+  test('out-of-order user-turn probes cannot roll back a newer turn', async () => {
+    const sessionID = 'sess-out-of-order-turns';
+    let releaseA!: (value: unknown) => void;
+    const gateA = new Promise((resolve) => {
+      releaseA = resolve;
+    });
+    let reads = 0;
+    const { mocks, mgr } = createBudgetManager(2, 0, {
+      messagesImpl: async () => {
+        reads += 1;
+        // A's identity probe hangs; C's probe (and later replay tails) see C
+        // persisted and external.
+        if (reads === 1) return gateA;
+        return {
+          data: [
+            {
+              info: { id: 'msg-C', role: 'user' },
+              parts: [{ type: 'text', text: 'C' }],
+            },
+          ],
+        };
+      },
+    });
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+
+    // A arrives first but its probe hangs; C arrives second and resolves first.
+    const eventA = mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          id: 'msg-A',
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-c' },
+        },
+      },
+    });
+    const eventC = mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          id: 'msg-C',
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-d' },
+        },
+      },
+    });
+    await eventC;
+
+    expect((mgr as any).sessionModel.get(sessionID)).toBe('openai/gpt-d');
+    expect((mgr as any).sessionRetries.get(sessionID)).toBeUndefined();
+
+    // C's turn then consumes one retry.
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-d',
+    });
+
+    // A's old probe finally resolves, still classified external.
+    releaseA({
+      data: [
+        {
+          info: { id: 'msg-A', role: 'user' },
+          parts: [{ type: 'text', text: 'A' }],
+        },
+      ],
+    });
+    await eventA;
+
+    // No rollback: A must not switch the model or clear C's already-spent
+    // budget.
+    expect((mgr as any).sessionModel.get(sessionID)).toBe('openai/gpt-d');
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+
+    // The next failure uses C's model and continues C's budget.
+    await mgr.handleEvent(errorEvent(sessionID));
+    expect((mgr as any).sessionModel.get(sessionID)).toBe('openai/gpt-d');
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(2);
+    expect(mocks.promptAsync.mock.calls[1]?.[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-d',
+    });
   });
 
   // ===========================================================================

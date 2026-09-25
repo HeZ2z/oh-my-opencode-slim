@@ -620,6 +620,14 @@ export class ForegroundFallbackManager {
    *  resets the session. An in-flight replay captures the epoch and refuses to
    *  write model/switch state (or restore old state) once a newer turn began. */
   private readonly turnEpoch = new Map<string, number>();
+  /** Monotonic sequence over all user-turn handling (across sessions). Versions
+   *  user-turn handling so an older probe that resolves late cannot roll back a
+   *  newer turn that already applied. */
+  private userTurnSeq = 0;
+  /** sessionID → sequence of the newest confirmed-external user turn whose
+   *  handling has been applied. A late handler carrying a smaller sequence is
+   *  dropped. Cleared on session deletion/dispose. */
+  private readonly userTurnLatest = new Map<string, number>();
   /** True once dispose() ran. `opencode reload` destroys this instance's
    *  context mid-attempt; in-flight fallback chains check this at every
    *  suspension point so their continuation never touches the old
@@ -726,6 +734,7 @@ export class ForegroundFallbackManager {
     this.replayMessageIds.clear();
     this.v2RetryTerminal.clear();
     this.turnEpoch.clear();
+    this.userTurnLatest.clear();
   }
 
   /** Dispose fence for fallback chains: true when this generation was
@@ -1081,6 +1090,7 @@ export class ForegroundFallbackManager {
           this.replayMessageIds.delete(id);
           this.v2RetryTerminal.delete(id);
           this.turnEpoch.delete(id);
+          this.userTurnLatest.delete(id);
         }
         break;
       }
@@ -1102,11 +1112,17 @@ export class ForegroundFallbackManager {
   ): Promise<void> {
     let picked: string | undefined;
     let switchRequest: Promise<unknown> | undefined;
+    let entryEpoch = 0;
     const from = `${event.model.providerID}/${event.model.id}`;
     try {
       const { sessionID } = event;
       if (!this.enabled || this.disposed || this.inProgress.has(sessionID))
         return;
+      // Capture the turn epoch of the retry-hook ENTRY, before any await (the
+      // model switch below): a genuine new user turn that starts while the
+      // switch is in flight must supersede this hook, which then must not write
+      // the old target back into the new turn.
+      entryEpoch = this.turnEpoch.get(sessionID) ?? 0;
       // Terminal once the chain is spent — ordinary or permanent quota: the
       // host must not keep retrying a session the fallback manager considers
       // exhausted. Cleared by a completed success, a primary-model new turn,
@@ -1164,7 +1180,16 @@ export class ForegroundFallbackManager {
         HOST_CALL_TIMEOUT_MS,
         'foreground retry model switch timed out',
       );
-      if (this.disposed) return;
+      if (
+        this.disposed ||
+        (this.turnEpoch.get(sessionID) ?? 0) !== entryEpoch
+      ) {
+        // A newer turn now owns the session (or this generation was disposed):
+        // leave the host decision untouched so it retries the CURRENT turn,
+        // and do not write the stale target, notify, toast or log a switch.
+        this.logSupersededFallback(sessionID);
+        return;
+      }
       event.decision = { retry: true, delay: this.retryDelayMs };
       this.sessionModel.set(sessionID, nextModel);
       this.onSessionModelChanged?.(sessionID, nextModel);
@@ -1176,22 +1201,30 @@ export class ForegroundFallbackManager {
       });
     } catch (err) {
       // Unconfirmed switch: keep the target selectable (a timed-out switch
-      // may still land; the next event's model is the host truth).
-      if (picked) this.sessionTried.get(event.sessionID)?.delete(picked);
+      // may still land; the next event's model is the host truth). Only roll
+      // the target back off `sessionTried` while this hook still owns the
+      // turn: after a newer turn, the tried state belongs to that turn and
+      // must not be mutated.
+      if (picked && (this.turnEpoch.get(event.sessionID) ?? 0) === entryEpoch) {
+        this.sessionTried.get(event.sessionID)?.delete(picked);
+      }
       const pendingSwitch = switchRequest;
       if (err instanceof OperationTimeoutError && picked && pendingSwitch) {
         // Late landing: the timeout cannot cancel the host call. If it
         // settles after we gave up, reconcile only when nothing advanced
         // the model since — the check and the write run synchronously, so
         // a hook that already moved on fails closed instead of being
-        // overwritten. No toast here: the next event's success path
-        // notifies; this only repairs state.
+        // overwritten. A newer turn (even one that returned to the same
+        // model) bumps the epoch, so the epoch check also fences it. No
+        // toast here: the next event's success path notifies; this only
+        // repairs state.
         const target = picked;
         void pendingSwitch.then(
           () => {
             if (
               this.disposed ||
-              this.sessionModel.get(event.sessionID) !== from
+              this.sessionModel.get(event.sessionID) !== from ||
+              (this.turnEpoch.get(event.sessionID) ?? 0) !== entryEpoch
             )
               return;
             this.sessionModel.set(event.sessionID, target);
@@ -1302,6 +1335,16 @@ export class ForegroundFallbackManager {
   // Core fallback logic
   // ---------------------------------------------------------------------------
 
+  /** Deterministic supersession notice for a fallback entry point whose turn
+   *  epoch was superseded by a newer user turn: sessionID only (no timestamps
+   *  or per-call ids). Shared by the promotion/abort/backoff/replay fences. */
+  private logSupersededFallback(sessionID: string): void {
+    log(
+      '[foreground-fallback] fallback superseded by a newer turn; fallback aborted',
+      { sessionID },
+    );
+  }
+
   private async tryFallback(sessionID: string, error?: unknown): Promise<void> {
     if (!sessionID) return;
     // Reload fence at entry, before any state mutation: a trigger racing
@@ -1314,6 +1357,11 @@ export class ForegroundFallbackManager {
     // Terminal stage-2 exhaustion: never intervene again for this session.
     // Dedup happens upstream; do not rely on it to prevent a repeat abort.
     if (this.isExhausted(sessionID)) return;
+
+    // Capture the turn epoch of the fallback ENTRY: a genuine new user turn
+    // that starts during the backoff below must supersede this attempt so we
+    // do not switch the new turn's model or replay the stale request.
+    const entryEpoch = this.turnEpoch.get(sessionID) ?? 0;
 
     // Set inProgress before delay to prevent concurrent fallback attempts
     this.inProgress.add(sessionID);
@@ -1338,8 +1386,14 @@ export class ForegroundFallbackManager {
           if (this.abandonedByDispose(sessionID)) return;
         }
       }
+      // The backoff may also have slept through a genuine new user turn: its
+      // epoch bump fences this attempt's continuation.
+      if ((this.turnEpoch.get(sessionID) ?? 0) !== entryEpoch) {
+        this.logSupersededFallback(sessionID);
+        return;
+      }
 
-      await this.execFallback(sessionID, error);
+      await this.execFallback(sessionID, error, entryEpoch);
       this.lastFallbackTime.set(sessionID, Date.now());
     } finally {
       this.inProgress.delete(sessionID);
@@ -1422,6 +1476,11 @@ export class ForegroundFallbackManager {
     if (this.withholdsAbortForLiveChildren(sessionID)) return;
     if (this.isExhausted(sessionID)) return;
 
+    // Capture the turn epoch of the fallback ENTRY: a genuine new user turn
+    // that starts during the promotion or abort below must supersede this
+    // attempt so we never abort the new turn or replay the stale request.
+    const entryEpoch = this.turnEpoch.get(sessionID) ?? 0;
+
     this.inProgress.add(sessionID);
     try {
       await this.promoteForegroundWaiter(sessionID);
@@ -1429,13 +1488,23 @@ export class ForegroundFallbackManager {
       // the meantime — never abort through a stale client.
       if (this.abandonedByDispose(sessionID)) return;
       if (this.withholdsAbortForLiveChildren(sessionID)) return;
+      if ((this.turnEpoch.get(sessionID) ?? 0) !== entryEpoch) {
+        this.logSupersededFallback(sessionID);
+        return;
+      }
       await abortSessionWithTimeout(getClient(this.input), sessionID);
       // The abort suspended across a dispose(): its outcome no longer
       // matters to the reloaded generation — do not continue into
       // execFallback (transcript read + replay on the dead client).
       // The finally below still releases the process-global slot.
       if (this.abandonedByDispose(sessionID)) return;
-      await this.execFallback(sessionID, error);
+      // The abort also suspended across a genuine new user turn: do not run
+      // execFallback against the turn that now owns the session.
+      if ((this.turnEpoch.get(sessionID) ?? 0) !== entryEpoch) {
+        this.logSupersededFallback(sessionID);
+        return;
+      }
+      await this.execFallback(sessionID, error, entryEpoch);
     } finally {
       this.inProgress.delete(sessionID);
     }
@@ -1458,7 +1527,15 @@ export class ForegroundFallbackManager {
     // Nothing is written until the message is confirmed to be a real external
     // turn: a late internal replay notification must not overwrite the active
     // model or reset the descent.
+    //
+    // Sequence the handling so an older probe that resolves late cannot roll
+    // back a newer turn that already applied (e.g. A's probe hangs, C's
+    // completes and resets, then A returns). Internal replays never claim the
+    // slot. Newest confirmed-external handling wins regardless of order.
+    const seq = ++this.userTurnSeq;
     if (await this.isInternalReplayUserMessage(sessionID, messageId)) return;
+    if ((this.userTurnLatest.get(sessionID) ?? 0) > seq) return;
+    this.userTurnLatest.set(sessionID, seq);
     if (model !== undefined) {
       this.sessionModel.set(sessionID, model);
     }
@@ -1497,31 +1574,41 @@ export class ForegroundFallbackManager {
       return true;
     }
 
-    const identity =
-      pendingUsable || inFlight
-        ? await this.probeReplayMessageIdentity(sessionID, messageId)
-        : 'external';
-
-    if (
-      pendingUsable &&
-      pending &&
-      this.pendingReplay.get(sessionID) === pending
-    ) {
-      this.pendingReplay.delete(sessionID);
-    }
+    // ALWAYS probe the transcript: a late replay notification can arrive after
+    // its pending record was superseded by a new turn, and with nothing in
+    // flight there is no other signal that would keep it from being misread as
+    // an external turn (which would overwrite the model and reset the budget).
+    const identity = await this.probeReplayMessageIdentity(
+      sessionID,
+      messageId,
+    );
 
     if (identity === 'internal') {
       this.rememberReplayMessageId(sessionID, messageId);
+      // The confirmed id now carries the internal identity; release the
+      // unconfirmed pending record (only when a newer replay has not already
+      // replaced it). Later still-unpersisted notifications are covered by
+      // the retained-record branch below.
+      if (
+        pendingUsable &&
+        pending &&
+        this.pendingReplay.get(sessionID) === pending
+      ) {
+        this.pendingReplay.delete(sessionID);
+      }
       return true;
     }
     if (identity === 'external') {
       // Present in the transcript without the marker: a real new turn, even
-      // while our own replay is still in flight.
+      // while our own replay is still in flight. The pending record is
+      // deliberately retained so a late replay notification stays
+      // recognisable (freshTurnResetHandler also retains it).
       return false;
     }
-    // Unknown (not persisted yet): assume ours only while a replay is in
-    // flight; otherwise it is a real turn.
-    return inFlight;
+    // Unknown (not persisted yet): we cannot exclude our own replay, so treat
+    // it as internal while a replay is in flight OR an unconfirmed record is
+    // still retained. Only then is it safe to call the message a real turn.
+    return inFlight || pendingUsable;
   }
 
   /** Retain a user message id confirmed as our own internal replay. */
@@ -1606,11 +1693,12 @@ export class ForegroundFallbackManager {
     this.lastTriggerModel.delete(sessionID);
     this.lastTriggerMap.delete(sessionID);
     this.lastFallbackTime.delete(sessionID);
-    // A new turn invalidates any in-flight replay's async completion and its
-    // pending identity record: the old replay must not write back into (or
-    // restore state for) the new turn.
+    // A new turn invalidates any in-flight replay's async completion: the
+    // epoch bump fences the old replay's own writes. The pending identity
+    // record is deliberately RETAINED (not deleted) so a late notification for
+    // the old replay's user message can still be recognised as internal
+    // instead of being misread as another real turn.
     this.turnEpoch.set(sessionID, (this.turnEpoch.get(sessionID) ?? 0) + 1);
-    this.pendingReplay.delete(sessionID);
 
     // Un-sealing a stage-2 abort is stricter: only a turn that returns to the
     // configured primary model re-opens the chain. A fallback-model turn (or a
@@ -1839,11 +1927,23 @@ export class ForegroundFallbackManager {
   private async execFallback(
     sessionID: string,
     error?: unknown,
+    entryEpoch?: number,
   ): Promise<void> {
     // Reload fence at entry: execFallback is reached after suspension
     // points in the tryFallback* callers; a disposed generation must not
     // even read the transcript through the old client.
     if (this.abandonedByDispose(sessionID)) return;
+    // Supersession fence at entry: the caller may have suspended (backoff,
+    // promotion, abort) while a genuine new user turn started. A threaded
+    // entryEpoch that no longer matches means this attempt belongs to the old
+    // turn — never switch the new turn's model or replay its request.
+    if (
+      entryEpoch !== undefined &&
+      (this.turnEpoch.get(sessionID) ?? 0) !== entryEpoch
+    ) {
+      this.logSupersededFallback(sessionID);
+      return;
+    }
     try {
       const selection = this.selectFallbackModel(sessionID, error);
       if (!selection) return;
@@ -1863,6 +1963,7 @@ export class ForegroundFallbackManager {
         currentModel,
         true,
         error,
+        entryEpoch,
       );
     } catch (err) {
       this.pendingReplay.delete(sessionID);
@@ -1913,11 +2014,22 @@ export class ForegroundFallbackManager {
     fromModel: string | undefined,
     isModelSwitch: boolean,
     error?: unknown,
+    expectedEpoch?: number,
   ): Promise<void> {
     const session = getClient(this.input).session;
     const agentName = this.sessionAgent.get(sessionID);
     const chain = this.resolveChain(agentName, targetModel);
     if (!chain.length) return;
+
+    // The replay's turn epoch. When the fallback entry threaded its epoch
+    // through (promotion/abort/backoff already awaited), honour it so a turn
+    // that started during those suspensions still supersedes this replay.
+    // Otherwise capture it now, BEFORE the first await (the transcript read
+    // below): a genuine new user turn that resets the session during the read
+    // bumps turnEpoch and must supersede this replay. Reading the epoch after
+    // the await would miss the reset and let a stale replay send its request
+    // and claim the switch inside the new turn.
+    const replayEpoch = expectedEpoch ?? this.turnEpoch.get(sessionID) ?? 0;
 
     // Fence captured BEFORE any await in the preparation: a board
     // relaunch during the transcript read or the admission await must
@@ -2078,10 +2190,23 @@ export class ForegroundFallbackManager {
     // Register this replay's identity BEFORE the prompt: the host may emit the
     // replay's own user message even after promptAsync returns (inProgress
     // already cleared), and that event must not be mistaken for a real turn.
-    // The turn epoch captured here fences the async completion: if a genuine
-    // new turn resets the session while this replay is in flight, the replay
-    // must not write model/switch state back into it.
-    const replayEpoch = this.turnEpoch.get(sessionID) ?? 0;
+    // `replayEpoch` (captured before the transcript read) fences the async
+    // completion: if a genuine new turn resets the session while this replay
+    // is in flight, the replay must not send or write model/switch state back
+    // into it.
+    const replaySuperseded = (): boolean =>
+      (this.turnEpoch.get(sessionID) ?? 0) !== replayEpoch;
+    const logReplaySuperseded = (): void => {
+      // Deterministic message: sessionID only (no timestamps/randomness).
+      this.logSupersededFallback(sessionID);
+    };
+    // Do not enroll a pending record for a replay already superseded during
+    // the transcript read, and never send its request.
+    if (replaySuperseded()) {
+      logReplaySuperseded();
+      withdrawHandoff();
+      return;
+    }
     this.pendingReplay.set(sessionID, {
       targetModel,
       baselineMessageID,
@@ -2125,6 +2250,15 @@ export class ForegroundFallbackManager {
         withdrawHandoff();
         throw promptErr;
       }
+      if (replaySuperseded()) {
+        // A genuine new turn arrived while the busy admission was failing: do
+        // not abort (the session now belongs to the new turn) and do not
+        // retry the stale replay.
+        logReplaySuperseded();
+        withdrawHandoff();
+        this.pendingReplay.delete(sessionID);
+        return;
+      }
       try {
         await abortSessionWithTimeout(getClient(this.input), sessionID);
       } catch (abortErr) {
@@ -2146,6 +2280,15 @@ export class ForegroundFallbackManager {
       // The abort/re-prompt-delay suspended across a dispose(): the
       // second replay must not go through the old client.
       if (this.abandonedByDispose(sessionID)) {
+        settleUnresolvedHandoff();
+        this.pendingReplay.delete(sessionID);
+        return;
+      }
+      if (replaySuperseded()) {
+        // A genuine new turn reset the session during the abort/delay: the
+        // abort already happened, so settle the armed handoff as unresolved
+        // and do not send the stale replay.
+        logReplaySuperseded();
         settleUnresolvedHandoff();
         this.pendingReplay.delete(sessionID);
         return;
@@ -2259,6 +2402,11 @@ export class ForegroundFallbackManager {
     if (this.inProgress.has(sessionID)) return;
     if (!this.hasFallbackChain(sessionID)) return;
 
+    // Capture the turn epoch at entry: the replay below (and any suspension it
+    // awaits) must not apply to a newer turn that started meanwhile. Internal
+    // replays still run inside replayFallbackPrompt's own epoch fences.
+    const entryEpoch = this.turnEpoch.get(sessionID) ?? 0;
+
     this.inProgress.add(sessionID);
     try {
       const agentName = this.sessionAgent.get(sessionID);
@@ -2277,6 +2425,7 @@ export class ForegroundFallbackManager {
         effectiveTarget,
         false,
         error,
+        entryEpoch,
       );
     } catch (err) {
       this.pendingReplay.delete(sessionID);

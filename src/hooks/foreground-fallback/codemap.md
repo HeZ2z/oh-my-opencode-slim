@@ -23,10 +23,11 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
   - `lastTriggerMap`: identity-based dedup keys → timestamps
   - `retryEpisode`: per-session `session.status` retry episode (model, episode id, seen attempts)
   - `initialDelayScheduled` / `pendingInitialDelay`: one initial-delay trigger per descent
-  - `pendingReplay`: identity of a just-issued internal replay (target model, baseline message id, admitted flag, window) so the replay's own user message, even when it arrives after `promptAsync` returned, is not mistaken for a real new turn
+  - `pendingReplay`: identity of a just-issued internal replay (target model, baseline message id, admitted flag, window) so the replay's own user message, even when it arrives after `promptAsync` returned, is not mistaken for a real new turn. It is retained across a confirmed new turn (`freshTurnResetHandler` does NOT drop it) so a late, not-yet-persisted replay notification is still recognisable; the `turnEpoch` bump fences the stale replay's own writes.
   - `replayMessageIds`: user message ids positively confirmed as our own internal replay. Retained for the session's lifetime (cleared on `session.deleted`/`dispose`), so repeated late notifications for the same replay stay idempotent even after `pendingReplay` is cleared, across later replays and across external turns. Memory grows only with the session's replay count.
   - `v2RetryTerminal`: sessions the v2 in-place retry hook has put into a terminal state (chain exhaustion once stage 2 is reached — ordinary or permanent quota). Later retry-hook calls answer `{ retry: false }` until a completed successful assistant response, a genuine new turn returning to the configured primary, or session deletion/dispose clears it — kept in lock-step with `chainExhaustion`.
-  - `turnEpoch`: bumped on every confirmed external user turn. An in-flight replay captures the epoch and refuses to write model/switch state (or restore old state) once a newer turn began.
+  - `turnEpoch`: bumped on every confirmed external user turn. Each fallback entry point (`tryFallback` / `tryFallbackWithAbort` / `retryCurrentModel`) captures the epoch at its entry and threads it through promotion, abort, backoff and `execFallback` into `replayFallbackPrompt`. Every suspension point re-checks it, so a fallback suspended on promotion/abort/backoff/transcript-read is abandoned rather than switching the newer turn; `replayFallbackPrompt` (when reached directly) still captures the epoch before its first await and re-checks it before every replay send, before the busy-path abort, and before any model/switch state write. `handleV2Retry` also captures it before the model-switch await (see the v2 retry bullet below).
+  - `userTurnSeq` / `userTurnLatest`: user-turn handling is versioned so probes that resolve out of order cannot roll back a newer turn. `handleUserTurn` takes a monotonically increasing `seq` before awaiting its transcript probe; internal replays never claim the slot, and a confirmed-external handler is dropped if a newer turn (higher `userTurnLatest`) already applied. `userTurnLatest` is cleared on `session.deleted`/`dispose`.
   - `inProgress`: process-global Set of sessions with an active retry/fallback, shared via `globalThis` + `Symbol.for`
 
 ### Decision Function
@@ -43,12 +44,13 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
 
 ### Retry Budget and Exhaustion
 - The v2 in-place retry hook shares the chain-global budget and quota policy. Absorbed retries, recoverable failures, missing chains and unsuccessful model switches leave the host decision unchanged. Once `selectFallbackModel` returns `exhausted` (stage 2 reached by an ordinary or a permanent quota error), the hook records a per-session terminal reason and sets `event.decision = { retry: false }`; every later retry-hook call on that session answers `{ retry: false }` before classification, delay and model selection. A first ordinary exhaustion still takes the sticky re-fallback (only the second lands here). The reason clears on a completed successful assistant response (in lock-step with stage 2), on `session.deleted`, `dispose`, and only when a genuine new user turn actually reopens stage 2 at the configured primary.
+- `handleV2Retry` captures the turn epoch at entry, before the `switchModel` await, and applies it to all three writes: the success path skips `event.decision`, `sessionModel.set`, `onSessionModelChanged`, the toast and the switched-log when the epoch moved (leaving the host decision untouched so it retries the current turn); the failure cleanup only rolls the target off `sessionTried` while the epoch still matches; and the late-landing reconcile callback bails when the epoch moved, so a timed-out switch that settles after a newer turn cannot write back.
 - `maxRetries = N` absorbs failures `1..N` on the current model; failure `N+1` (and every later failure) advances the chain. `maxRetries = 0` switches immediately.
 - The budget is **chain-global** and is not cleared on a model switch.
 - Cleared only on: a completed successful assistant response, `session.deleted`, or a confirmed new user turn.
 - **Permanent usage/quota failures** (`isPermanentUsageQuotaError`: 402, explicit spending / personal-team-blocked limits, "coding plan package has expired", fixed-window limit reached/exhausted, explicit quota exhausted, provider billing codes) skip the budget entirely — no same-model replay — and never take the sticky re-fallback; `execFallback` aborts at stage 2 when the chain is spent. Ordinary 429 / rate-limit / short-term "quota threshold" wording keeps using the configured budget.
 - `isExhausted` (stage 2) short-circuits every failover event and both `tryFallback`/`tryFallbackWithAbort`, so a spent chain aborts at most once.
-- `freshTurnResetHandler` runs on a confirmed new `user` turn (the SDK `UserMessage` nests the model under `info.model`; assistant messages keep it top-level): it cancels a pending initial-delay trigger and clears the budget, retry episode, `sessionTried`, dedup anchors and `lastFallbackTime`, drops any stale `pendingReplay`, and bumps `turnEpoch`. Identity is decided BEFORE any state write: `handleUserTurn` treats a message as internal when its id is retained (`replayMessageIds`), matches the pending baseline, or the transcript shows the internal-initiator marker; a message present in the transcript WITHOUT the marker is a real turn even while a replay is in flight, and an unpersisted message is treated as internal only while a replay is in flight. An in-flight replay whose `turnEpoch` advanced skips its model/switch claim and its switched-log/toast, so a superseded replay cannot write back into the newer turn. Un-sealing the stage-2 terminal guard additionally requires the turn to return to `chain[0]`.
+- `freshTurnResetHandler` runs on a confirmed new `user` turn (the SDK `UserMessage` nests the model under `info.model`; assistant messages keep it top-level): it cancels a pending initial-delay trigger and clears the budget, retry episode, `sessionTried`, dedup anchors and `lastFallbackTime`, retains `pendingReplay` (so a late replay notification is still recognised), and bumps `turnEpoch`. Identity is decided BEFORE any state write: `handleUserTurn` treats a message as internal when its id is retained (`replayMessageIds`), matches the pending baseline, or — after ALWAYS probing the transcript via `probeReplayMessageIdentity` — shows the internal-initiator marker; a message present in the transcript WITHOUT the marker is a real turn even while a replay is in flight, and an unpersisted (`unknown`) message is treated as internal while a replay is in flight OR a usable `pendingReplay` record is retained (never shortcut to external merely because nothing is in flight). An in-flight replay whose `turnEpoch` advanced skips its model/switch claim and its switched-log/toast, so a superseded replay cannot write back into the newer turn. Turn handling is versioned (`userTurnSeq`/`userTurnLatest`): the newest confirmed-external handler wins, so a probe resolving out of order is dropped rather than rolling back a newer turn. Un-sealing the stage-2 terminal guard additionally requires the turn to return to `chain[0]`.
 
 ### Deduplication (identity-based)
 - No error-text + time-window heuristic: identical text can be the next real failure.
@@ -69,17 +71,20 @@ Identity dedup gate (message id / retry episode / none)
     ↓
 decideIntervention() → consume one budget unit
     ↓ absorb (terminal)                    ↓ absorb (host retry)   ↓ fallback
-retryCurrentModel()                        no-op                  tryFallback*/execFallback
-    ↓                                                              ↓
-replayFallbackPrompt(current model)                                replayFallbackPrompt(next model)
+retryCurrentModel()                        no-op                  tryFallback* (entryEpoch captured)
+    ↓                                                              ↓ promotion/abort/backoff: epoch re-check
+replayFallbackPrompt(current model, entryEpoch)                    replayFallbackPrompt(next model, entryEpoch)
     ↓
 promptAsync() [tail transcript read → full read fallback]
     ↓
 admit background handoff · claim switch (fallback only) · toast
 ```
 
+User-turn handling is versioned: `handleUserTurn` takes a `seq` before its identity probe and only the newest confirmed-external handler may write the model and reset the budget, so an older probe resolving late cannot roll back a newer turn.
+
 ### Shared Replay
-`replayFallbackPrompt(sessionID, targetModel, fromModel, isModelSwitch, error)` is used by both `execFallback` (model switch) and `retryCurrentModel` (same model):
+`replayFallbackPrompt(sessionID, targetModel, fromModel, isModelSwitch, error, expectedEpoch?)` is used by both `execFallback` (model switch) and `retryCurrentModel` (same model):
+- Uses the fallback entry's `expectedEpoch` when threaded through (so a turn that started during outer promotion/abort/backoff is caught), otherwise captures `replayEpoch` before the first await. Checks it (a) before enrolling `pendingReplay`/the first send, (b) before the busy-path abort, and (c) before the second send — a superseded attempt logs `fallback superseded by a newer turn; fallback aborted` and returns without sending, enrolling a record, or writing model/switch state.
 - Reads only the transcript tail (`FALLBACK_REPLAY_TAIL_MESSAGES`) with a full-read fallback; preserves both read errors.
 - Arms the background observation handoff before the admission await and admits it exactly once on acceptance.
 - On a busy-session `promptAsync` failure, promotes a foreground waiter, aborts, waits `REPROMPT_DELAY_MS`, and retries **once**. An abort transport failure logs `fallback abort failed`; a rejected second prompt logs `retry prompt failed`. Both convert the armed handoff (never drop it), end the attempt without further retry, and let the caller's `finally` release `inProgress`.
@@ -107,7 +112,7 @@ admit background handoff · claim switch (fallback only) · toast
 - Dedup keys are pruned once outside the 5s window
 
 ### Observability
-Structured logs at: retry-budget absorb/fallback, delaying initial fallback, failover status diagnosis, switched to fallback model, fallback abort failed, retry prompt failed, chain-exhaustion stage transitions, fresh-turn reset, promptAsync unavailable.
+Structured logs at: retry-budget absorb/fallback, delaying initial fallback, failover status diagnosis, switched to fallback model, fallback abort failed, retry prompt failed, fallback superseded by a newer turn, chain-exhaustion stage transitions, fresh-turn reset, promptAsync unavailable.
 
 ## Error Handling
 - **Graceful degradation**: abort/promotion may be slow or incomplete; failures are fail-soft
