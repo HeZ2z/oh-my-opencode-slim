@@ -604,6 +604,18 @@ export class ForegroundFallbackManager {
       admitted: boolean;
     }
   >();
+  /** sessionID → user message ids positively confirmed as our own internal
+   *  replay. A late or repeated host notification for one of these must never
+   *  reset the retry budget, even after `pendingReplay` is cleared and even
+   *  across later replays or external turns. Kept for the session's lifetime
+   *  (only ids confirmed from the transcript are retained, so the set grows
+   *  with the session's replay count) and cleared on session deletion/dispose. */
+  private readonly replayMessageIds = new Map<string, Set<string>>();
+  /** sessionID → set once the v2 in-place retry hook exhausted a chain on a
+   *  permanent quota/billing error. Later retry-hook calls on that terminal
+   *  session answer `{ retry: false }` until a genuine new user turn returns
+   *  to the configured primary (or the session is deleted/disposed). */
+  private readonly v2RetryTerminal = new Set<string>();
   /** True once dispose() ran. `opencode reload` destroys this instance's
    *  context mid-attempt; in-flight fallback chains check this at every
    *  suspension point so their continuation never touches the old
@@ -707,6 +719,8 @@ export class ForegroundFallbackManager {
     }
     this.pendingInitialDelay.clear();
     this.pendingReplay.clear();
+    this.replayMessageIds.clear();
+    this.v2RetryTerminal.clear();
   }
 
   /** Dispose fence for fallback chains: true when this generation was
@@ -890,6 +904,9 @@ export class ForegroundFallbackManager {
           this.sessionRetries.delete(sessionID);
           this.initialDelayScheduled.delete(sessionID);
           this.chainExhaustion.delete(sessionID);
+          // Keep the v2 terminal decision in lock-step with stage 2: a
+          // recovered session must not keep answering `{ retry: false }`.
+          this.v2RetryTerminal.delete(sessionID);
           this.lastFallbackTime.delete(sessionID);
           // A success also ends any failure streak, so the models the
           // streak marked tried are no longer proven dead. Static-chain
@@ -1060,6 +1077,8 @@ export class ForegroundFallbackManager {
             this.pendingInitialDelay.delete(id);
           }
           this.pendingReplay.delete(id);
+          this.replayMessageIds.delete(id);
+          this.v2RetryTerminal.delete(id);
         }
         break;
       }
@@ -1086,6 +1105,12 @@ export class ForegroundFallbackManager {
       const { sessionID } = event;
       if (!this.enabled || this.disposed || this.inProgress.has(sessionID))
         return;
+      // Terminal from a prior permanent-quota exhaustion: the host must not
+      // retry this session again until a genuine new turn reopens the chain.
+      if (this.v2RetryTerminal.has(sessionID)) {
+        event.decision = { retry: false };
+        return;
+      }
       if (!isFailoverError(event.error)) return;
       if (
         this.initialRetryDelayMs > 0 &&
@@ -1111,7 +1136,22 @@ export class ForegroundFallbackManager {
       )
         return;
       const selected = this.selectFallbackModel(sessionID, event.error);
-      if (!selected || selected === 'exhausted') return;
+      if (!selected || selected === 'exhausted') {
+        if (
+          selected === 'exhausted' &&
+          isPermanentUsageQuotaError(event.error)
+        ) {
+          // Permanent quota/billing exhaustion is terminal for this session:
+          // tell the host not to retry, and keep answering that way.
+          this.v2RetryTerminal.add(sessionID);
+          event.decision = { retry: false };
+          log(
+            '[foreground-fallback] v2 retry hook terminal: permanent quota exhausted',
+            { sessionID },
+          );
+        }
+        return;
+      }
       const { agentName, nextModel, ref } = selected;
       picked = nextModel;
       switchRequest = switchModel(sessionID, {
@@ -1414,6 +1454,14 @@ export class ForegroundFallbackManager {
     messageId: string | undefined,
     model: string | undefined,
   ): Promise<void> {
+    // A message id already confirmed as our own replay stays internal for the
+    // session: late or repeated notifications must not reset the budget.
+    if (
+      messageId !== undefined &&
+      this.replayMessageIds.get(sessionID)?.has(messageId)
+    ) {
+      return;
+    }
     // Still inside our own replay (promptAsync has not returned yet).
     if (this.inProgress.has(sessionID)) return;
 
@@ -1428,15 +1476,32 @@ export class ForegroundFallbackManager {
         }
         if (await this.isInternalReplayMessage(sessionID, messageId)) {
           // Our own replay message, possibly delivered after the prompt
-          // returned. Keep the descent state.
-          this.pendingReplay.delete(sessionID);
+          // returned. Confirm and retain its id, then keep the descent state.
+          this.rememberReplayMessageId(sessionID, messageId);
+          // Delete only the record we examined: a newer replay may have
+          // registered while the transcript read was in flight.
+          if (this.pendingReplay.get(sessionID) === pending) {
+            this.pendingReplay.delete(sessionID);
+          }
           return;
         }
       }
       // Anything we cannot positively identify as our replay is a real turn.
-      this.pendingReplay.delete(sessionID);
+      if (this.pendingReplay.get(sessionID) === pending) {
+        this.pendingReplay.delete(sessionID);
+      }
     }
     this.freshTurnResetHandler(sessionID, model);
+  }
+
+  /** Retain a user message id confirmed as our own internal replay. */
+  private rememberReplayMessageId(sessionID: string, messageId: string): void {
+    let ids = this.replayMessageIds.get(sessionID);
+    if (!ids) {
+      ids = new Set<string>();
+      this.replayMessageIds.set(sessionID, ids);
+    }
+    ids.add(messageId);
   }
 
   /** Confirm a user message carries the internal-initiator marker we attach to
@@ -1518,6 +1583,7 @@ export class ForegroundFallbackManager {
     const primary = agentName ? this.chains[agentName]?.[0] : undefined;
     if (primary === undefined || newModel !== primary) return;
     this.chainExhaustion.delete(sessionID);
+    this.v2RetryTerminal.delete(sessionID);
     log('[foreground-fallback] fresh turn reset from stage-2', {
       sessionID,
       agentName,

@@ -240,6 +240,129 @@ describe('ForegroundFallbackManager v2 retry hook', () => {
       jest.useRealTimers();
     }
   });
+
+  test('a permanent quota exhaustion is terminal until a primary-model new turn', async () => {
+    createMockClient();
+    const mgr = retryMgr(['A']); // single-model chain
+    const sid = 'retry-terminal-quota';
+    const switchModel = mock(async () => {});
+
+    const first = {
+      ...retryEvent(sid, 'A'),
+      error: { message: 'Monthly usage limit reached' },
+      decision: { retry: true },
+    };
+    await mgr.handleV2Retry(first, switchModel);
+    expect(switchModel).not.toHaveBeenCalled();
+    expect(first.decision).toEqual({ retry: false });
+    expect((mgr as any).v2RetryTerminal.has(sid)).toBe(true);
+
+    // Later retry events keep answering { retry: false } without a switch.
+    const second = { ...retryEvent(sid, 'A'), decision: { retry: true } };
+    await mgr.handleV2Retry(second, switchModel);
+    expect(second.decision).toEqual({ retry: false });
+    expect(switchModel).not.toHaveBeenCalled();
+
+    // A genuine primary-model user turn reopens the chain.
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: sid,
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'test', modelID: 'A' },
+        },
+      },
+    });
+    expect((mgr as any).v2RetryTerminal.has(sid)).toBe(false);
+  });
+
+  test('a completed assistant response clears the v2 terminal with stage-2', async () => {
+    createMockClient();
+    const mgr = retryMgr(['A']); // single-model chain can reach exhaustion
+    const sid = 'retry-terminal-success';
+    const switchModel = mock(async () => {});
+
+    const first = {
+      ...retryEvent(sid, 'A'),
+      error: { message: 'Monthly usage limit reached' },
+      decision: { retry: true },
+    };
+    await mgr.handleV2Retry(first, switchModel);
+    expect(first.decision).toEqual({ retry: false });
+    expect((mgr as any).v2RetryTerminal.has(sid)).toBe(true);
+    expect((mgr as any).chainExhaustion.get(sid)).toBe(2);
+
+    // A completed, successful assistant response proves recovery and must
+    // clear BOTH terminal markers together.
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: sid,
+          agent: 'orchestrator',
+          role: 'assistant',
+          time: { created: 1, completed: 2 },
+        },
+      },
+    });
+    expect((mgr as any).chainExhaustion.has(sid)).toBe(false);
+    expect((mgr as any).v2RetryTerminal.has(sid)).toBe(false);
+
+    // A genuine user turn after recovery is not short-circuited by a lingering
+    // terminal marker.
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: sid,
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'test', modelID: 'A' },
+        },
+      },
+    });
+    expect((mgr as any).v2RetryTerminal.has(sid)).toBe(false);
+  });
+
+  test('an ordinary absorbed retry leaves the v2 host decision intact', async () => {
+    createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['test/A', 'test/B'] },
+      true,
+      { directory: '/test' } as any,
+      1, // maxRetries=1 → the first error is absorbed
+    );
+    const sid = 'retry-absorbed-decision';
+    const decision = { retry: true, delay: 2000 };
+    const event = { ...retryEvent(sid, 'A'), decision };
+    const switchModel = mock(async () => {});
+    await mgr.handleV2Retry(event, switchModel);
+    expect(switchModel).not.toHaveBeenCalled();
+    expect(event.decision).toBe(decision);
+  });
+
+  test('a session without a chain leaves the v2 host decision intact', async () => {
+    createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['test/A', 'test/B'] },
+      true,
+      { directory: '/test' } as any,
+      0,
+    );
+    const sid = 'retry-no-chain';
+    const decision = { retry: true };
+    const event = {
+      ...retryEvent(sid, 'A'),
+      agent: 'explorer', // no chain configured for this agent
+      decision,
+    };
+    const switchModel = mock(async () => {});
+    await mgr.handleV2Retry(event, switchModel);
+    expect(switchModel).not.toHaveBeenCalled();
+    expect(event.decision).toBe(decision);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -6432,6 +6555,178 @@ describe('ForegroundFallbackManager retry budget', () => {
     });
 
     expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+  });
+
+  test('a retained replay id suppresses repeated notifications without re-reading', async () => {
+    const sessionID = 'sess-replay-retained';
+    const replayMessageId = 'replay-msg-1';
+    const baseMessages = [
+      {
+        info: { id: 'u1', role: 'user' },
+        parts: [{ type: 'text', text: 'hello' }],
+      },
+    ];
+    let reads = 0;
+    createMockClient({
+      messagesImpl: async () => {
+        reads += 1;
+        if (reads === 1) return { data: baseMessages };
+        return {
+          data: [
+            ...baseMessages,
+            {
+              info: { id: replayMessageId, role: 'user' },
+              parts: [
+                {
+                  type: 'text',
+                  text: 'hello\n<!-- SLIM_INTERNAL_INITIATOR -->',
+                  synthetic: true,
+                  metadata: { 'oh-my-opencode-slim.internalInitiator': true },
+                },
+              ],
+            },
+          ],
+        };
+      },
+    });
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      undefined,
+      0,
+      0,
+    );
+
+    await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+    await mgr.handleEvent(errorEvent(sessionID)); // absorbed → replay (read #1)
+    const afterReplay = reads;
+
+    const notify = () =>
+      mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID,
+            id: replayMessageId,
+            agent: 'orchestrator',
+            role: 'user',
+            model: { providerID: 'openai', modelID: 'gpt-b' },
+          },
+        },
+      });
+
+    await notify(); // confirmed via transcript read (#2)
+    const afterConfirm = reads;
+    expect(
+      (mgr as any).replayMessageIds.get(sessionID)?.has(replayMessageId),
+    ).toBe(true);
+    expect(afterConfirm).toBeGreaterThan(afterReplay);
+
+    await notify(); // retained id → no further transcript read
+    expect(reads).toBe(afterConfirm);
+    expect((mgr as any).sessionRetries.get(sessionID)).toBe(1);
+  });
+
+  test('an async old-message lookup does not erase a newer pending replay', async () => {
+    const sessionID = 'sess-replay-race';
+    let resolveRead!: (value: unknown) => void;
+    const read = new Promise((resolve) => {
+      resolveRead = resolve;
+    });
+    createMockClient({ messagesImpl: () => read });
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      undefined,
+      0,
+      0,
+    );
+
+    const oldRecord = {
+      targetModel: 'openai/gpt-b',
+      baselineMessageID: 'u0',
+      startedAt: Date.now(),
+      admitted: true,
+    };
+    (mgr as any).pendingReplay.set(sessionID, oldRecord);
+
+    const pending = mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          id: 'old-replay-msg',
+          agent: 'orchestrator',
+          role: 'user',
+          model: { providerID: 'openai', modelID: 'gpt-b' },
+        },
+      },
+    });
+
+    // A newer replay registers while the old transcript read is in flight.
+    const newerRecord = {
+      targetModel: 'openai/gpt-c',
+      baselineMessageID: 'u1',
+      startedAt: Date.now(),
+      admitted: true,
+    };
+    (mgr as any).pendingReplay.set(sessionID, newerRecord);
+
+    resolveRead({
+      data: [
+        {
+          info: { id: 'old-replay-msg', role: 'user' },
+          parts: [
+            {
+              type: 'text',
+              text: 'x\n<!-- SLIM_INTERNAL_INITIATOR -->',
+              synthetic: true,
+              metadata: { 'oh-my-opencode-slim.internalInitiator': true },
+            },
+          ],
+        },
+      ],
+    });
+    await pending;
+
+    // The old lookup confirmed and retained its id without deleting the
+    // newer pending record.
+    expect((mgr as any).pendingReplay.get(sessionID)).toBe(newerRecord);
+    expect(
+      (mgr as any).replayMessageIds.get(sessionID)?.has('old-replay-msg'),
+    ).toBe(true);
+  });
+
+  test('session deletion and disposal clear retained replay ids and the v2 terminal', async () => {
+    createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+    );
+    const sessionID = 'sess-retained-clear';
+    (mgr as any).replayMessageIds.set(sessionID, new Set(['m1']));
+    (mgr as any).v2RetryTerminal.add(sessionID);
+
+    await mgr.handleEvent({
+      type: 'session.deleted',
+      properties: { info: { id: sessionID } },
+    });
+    expect((mgr as any).replayMessageIds.has(sessionID)).toBe(false);
+    expect((mgr as any).v2RetryTerminal.has(sessionID)).toBe(false);
+
+    (mgr as any).replayMessageIds.set(sessionID, new Set(['m2']));
+    (mgr as any).v2RetryTerminal.add(sessionID);
+    mgr.dispose();
+    expect((mgr as any).replayMessageIds.size).toBe(0);
+    expect((mgr as any).v2RetryTerminal.size).toBe(0);
   });
 
   // ===========================================================================
