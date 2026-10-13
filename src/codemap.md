@@ -183,7 +183,7 @@ Key event flows:
 
 - Plugin config loaded via `loadPluginConfig()` with support for:
   - User overrides from `~/.config/opencode/oh-my-opencode-slim.json`
-  - Preset switching via the TUI `/preset` manager (persisted to the config file; v2 hosts request the live inference-profile refresh for NEW child sessions and the sidebar — existing sessions stay frozen — and a malformed config keeps the last-known-good state; v1 hosts apply on next reload)
+  - Preset switching via the TUI `/preset` manager (persisted to the config file; v2 hosts request the live inference-table refresh for NEW child sessions and the sidebar — each child freezes its profile and fallback candidates together on first capture, so existing sessions descend their captured chain — and a malformed config keeps the last-known-good state; registered identities and marketplace roster/installed content are frozen, so an identity/roster change needs a reload; v1 hosts apply on next reload)
   - Environment-based disablement via `OH_MY_OPENCODE_SLIM_DISABLE`
 - Agent configurations merged with user settings from OpenCode config
 - Model resolution supports both string models and array-based fallback chains

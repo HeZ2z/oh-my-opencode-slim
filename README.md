@@ -187,11 +187,22 @@ The default generated configuration includes both `openai` and `opencode-go` pre
 Presets can inherit from one base preset with `extends`: a `design` preset can
 extend `base` and override only its designer model. Changes are persisted by
 `/preset`. On v2 hosts the saved/applied preset's inference fields (`model`,
-`variant`, `temperature`, `options`) apply to new child dispatches (frozen for
-each child before its first request) and the sidebar once the server-side
-config watcher has refreshed them; a malformed config keeps the last-known-good
-state, and existing sessions plus prompt/tool/policy/skill/MCP changes stay
-frozen until a full reload; on v1 hosts reload OpenCode. See
+`variant`, `temperature`, `options`) and that agent's fallback candidates apply
+to new child dispatches once the server-side config watcher has refreshed them;
+a malformed config keeps the last-known-good state. A child freezes its whole
+inference entry — profile and fallback candidates together — on the first
+successful `created`/`prompt` capture, so a child captured before a refresh
+keeps descending its captured chain (with its tried/exhaustion state) while a
+child first captured afterwards gets the refreshed chain; v2 delegation routes
+by the latest published table. Agent identities and the marketplace
+roster/installed content are frozen for the generation, so a config edit that
+changes `displayName`/`disabled_agents` or the selected packages requires a
+reload rather than a hot refresh. The sidebar is a post-publish projection: a
+write failure is logged and the next refresh rewrites the latest state, with no
+eventual-sync guarantee. Existing sessions plus prompt/tool/policy/skill/MCP
+changes stay frozen until a full reload, and `ctx.agent.reload()` is not a hot
+inference fix; on v1 hosts reload OpenCode. The initial model-selection
+heuristic (including its explicit/automatic-source ambiguity) is unchanged. See
 [Configuration](docs/configuration.md#preset-inheritance) for the inheritance
 example and precedence rules.
 

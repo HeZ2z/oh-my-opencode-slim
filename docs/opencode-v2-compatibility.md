@@ -219,11 +219,12 @@ not an optional-degradation path.
       full emulation as fallback. The session-frozen profile bridge is also
       awaited from this hook BEFORE the admission's first model request: it
       resolves the session's identity and model through `session.get`,
-      then freezes the child's runtime profile. It applies `session.switchModel`
+      then freezes the child's whole inference entry — profile and fallback
+      candidates together. It applies `session.switchModel`
       only while the child still uses the agent's startup-registered model;
       a different explicit or routed model retains its variant without a switch.
-      Hot refresh compares against that startup model, not the refreshed profile.
-      Capture remains idempotent (the event-stream
+      Hot refresh resolves against the startup-registered defaults, not the
+      refreshed table. Capture remains idempotent (the event-stream
       `session.created` consumer is only a prewarm/cleanup path — a first
       child request can never race the asynchronous event pump).
     - a native `ctx.session.hook("model.request")` registration
@@ -387,6 +388,54 @@ mutate an active registry. When no finalized registry is available (for example,
 in standalone CLI use), status reports `reloadRequired: null` because the live
 side cannot be observed.
 
+Finalization also publishes the complete inference table (see
+[Session-frozen inference](#session-frozen-inference-and-fallback-candidates)):
+the registered roster's inference entries with their fallback candidates,
+resolved once and swapped as a single reference. The registered agent identities
+and the selected marketplace roster/installed package content are frozen with
+that generation; edits to `displayName`/`disabled_agents` or selected packages do not change
+the registered roster during an inference refresh and require a reload to
+apply. `ctx.agent.reload()` is not a hot
+inference fix.
+
+## Session-frozen inference and fallback candidates
+
+Config and preset edits hot-apply **only** as inference: for each agent, the
+`model`/`variant` and the ordered fallback candidates (with per-candidate
+variants), plus `temperature`/provider `options` and the sidebar projection.
+One fresh resolution builds the complete immutable table and one reference
+replacement publishes it; a malformed config is rejected before any swap and the
+last-known-good table/sidebar stay.
+
+Each plugin child freezes its whole agent entry — profile and fallback
+candidates together — on the FIRST successful capture. Capture runs on both the
+`created` event (prewarm) and the awaited `session.prompt` admission path; once
+captured it is frozen for the child's lifetime and released on
+`session.deleted`. Consequences:
+
+- A child captured before a refresh keeps descending its CAPTURED chain with its
+  tried/exhaustion state; a refresh never rewrites an existing child's chain.
+- A child first captured after a refresh receives the refreshed chain and
+  profile.
+- A failed switch leaves the child pending (no freeze): the host decision
+  stands and the next attempt re-runs against the then-current entry. Capture
+  timing and the initial model-selection heuristic (including its
+  explicit/automatic-source ambiguity — no source-detection guarantee) are
+  unchanged.
+
+The manager reads a three-state binding per session: a `bound-child` descends
+its captured candidates (an empty/disabled chain never falls back to the startup
+chain), a `pending-child` is not steered, and root/foreign/unconfirmed sessions
+keep the original startup policy. v2 delegate selection reads the LATEST
+published table (not the startup chain). Automatic foreground replay fallback
+stays disabled on v2; the in-place retry-hook steering path remains active and
+follows the frozen binding.
+
+The sidebar is a post-publish file projection: a write failure is logged after
+the in-memory table is published and never rolls back memory; the next refresh
+rewrites the latest projection, with no eventual-sync guarantee (no retry
+queue).
+
 ## Feature matrix
 
 | Capability | v1 (`opencode`) | v2 (`opencode2`) | Notes |
@@ -404,7 +453,7 @@ side cannot be observed.
 | webfetch secondary-model summaries | ✅ | ✅ via `ctx.generate.text` | host without `ctx.generate` → summaries unavailable (logged) |
 | Background-job state persistence (tombstones, deletion epochs) | ➖ process-local | ✅ via `ctx.storage` | optional domain; absent → pure in-memory fallback, zero behavior change (see [Background job state](#background-job-state-rehydrate-probe-and-persistence)) |
 | Foreground model fallback (rate-limit failover) | ✅ | ❌ disabled pending an atomic turn-conditional host switch | v2's non-atomic `session.switchModel` + steer replay could alter/replay a newer turn |
-| `/preset` (preset manager) | ✅ | ✅ TUI plugin entry (`./tui` → `dist/tui2.js`): sidebar (incl. clickable active-preset row) + the same three-level manager as v1 on bare `/preset`, or `/preset <name>` fast path | The layer registers from an `append: "app"` slot render because the host's `keymap.layer` is provider-scoped (calling it from plugin `setup` throws `Keymap.Provider is missing`); the command carries an `id` and `slash.arguments`; host needs `ui.slot` + `keymap.layer`; the manager needs `ui.dialog.select` + `prompt` + `confirm` (without them the sidebar preset row is informational-only, but `/preset <name>` still applies); feedback uses `ui.toast.show`; config-file `preset` still applies at load. Config edits (manual, manager saves, `/preset`) are watched over `.json` + `.jsonc` candidates (user + project, including files/directories created later, arbitrary `OPENCODE_CONFIG_DIR` names, and nested missing ancestors; ~300 ms debounce) and hot-applied **only** as inference profiles: `model`/`variant` via `session.switchModel` and `temperature`/`options` on the captured child session's request options, plus the sidebar's tui-state model entries. Capture is awaited on the `session.prompt` request path (the `session.created` event consumer is only a prewarm) so a first child request cannot race the event pump. Agent definitions, prompts, tools, permissions, skills, and MCPs stay frozen for the session lifetime; the host registry is never reloaded. The TUI **requests** this refresh and reports `Saved … Live refresh requested`; it cannot observe the server-side watcher (separate process, no safe plugin RPC bridge on the supported host), which logs its own failure cause. A malformed config (`invalid-json`/`invalid-schema`/`read-error`) is rejected before any swap — the last-known-good profiles/sidebar stay — and the fix-and-reload fallback applies |
+| `/preset` (preset manager) | ✅ | ✅ TUI plugin entry (`./tui` → `dist/tui2.js`): sidebar (incl. clickable active-preset row) + the same three-level manager as v1 on bare `/preset`, or `/preset <name>` fast path | The layer registers from an `append: "app"` slot render because the host's `keymap.layer` is provider-scoped (calling it from plugin `setup` throws `Keymap.Provider is missing`); the command carries an `id` and `slash.arguments`; host needs `ui.slot` + `keymap.layer`; the manager needs `ui.dialog.select` + `prompt` + `confirm` (without them the sidebar preset row is informational-only, but `/preset <name>` still applies); feedback uses `ui.toast.show`; config-file `preset` still applies at load. Config edits (manual, manager saves, `/preset`) are watched over `.json` + `.jsonc` candidates (user + project, including files/directories created later, arbitrary `OPENCODE_CONFIG_DIR` names, and nested missing ancestors; ~300 ms debounce) and hot-applied **only** as inference profiles: `model`/`variant` via `session.switchModel` and `temperature`/`options` on the captured child session's request options, plus the sidebar's tui-state model entries. Capture is awaited on the `session.prompt` request path (the `session.created` event consumer is only a prewarm) so a first child request cannot race the event pump. Agent definitions, prompts, tools, permissions, skills, and MCPs stay frozen for the session lifetime; the host registry is never reloaded. The TUI **requests** this refresh and reports `Saved … Live refresh requested`; it cannot observe the server-side watcher (separate process, no safe plugin RPC bridge on the supported host), which logs its own failure cause. A malformed config (`invalid-json`/`invalid-schema`/`read-error`) is rejected before any swap — the last-known-good profiles/sidebar stay — and the fix-and-reload fallback applies. Each child's frozen entry also carries its fallback candidates (see [Session-frozen inference and fallback candidates](#session-frozen-inference-and-fallback-candidates)): a refresh affects new children only, while an existing child keeps descending its captured chain; the sidebar is a post-publish projection (a write failure is logged, and the next refresh retries the projection, with no eventual-sync guarantee); the marketplace roster/installed content and agent identities are frozen for the generation, so a `displayName`/`disabled_agents` or selected-package change requires a reload |
 | Default primary agent | ✅ finalized visible orchestrator identity | ✅ `draft.default(<visible orchestrator identity>)`; the canonical `orchestrator` entry remains a hidden alias when `displayName` is configured | v1 `default_agent` and v2 draft default target the same visible entry |
 | TUI default agent | ✅ orchestrator | ✅ host follows the default primary agent and hoists it to the head of the agent list | — |
 | Multiplexer (tmux/zellij/herdr/cmux-tui panes) | ✅ | ✅ TUI plugin entry wires the client-owned pane lifecycle through a v2 host adapter: shared background service and `--server` hosts are supported, `--standalone` is fail-closed (one diagnostic per process, `/subagent` fallback — opens a tab without moving focus) | Defaults are host-specific: `"tui"` on v1 (`opencode attach <url> --session <id> --dir <dir>`); `"mini"` on v2 shared (`opencode mini --session <id>`) and remote (`opencode mini --server <url> --session <id>`), with the pane cwd pinned by the adapter. Explicit `viewer: "tui"` retains the v2 full-TUI commands with a positional directory; v1 `viewer: "mini"` appends `--mini` to attach (OpenCode >= 1.17.10), without extra cwd pinning. The `OPENCODE_PASSWORD` secret is injected through the multiplexer's spawn-time environment (or a Linux + POSIX-shell `/proc` bridge on zellij/cmux-tui), never through the viewer's command line — see [Secret handling](multiplexer-integration.md#known-limitations). Events are projected from `session.created` / `session.execution.*` / `session.idle` / `session.deleted`; directory attribution is recorded at `session.created` because execution events carry none |
@@ -741,6 +790,13 @@ otherwise commit after a newer user turn takes over. Fallback will remain
 disabled until the host provides that turn-conditional operation. Other prompt
 callers, like the orchestrator-wake scheduler, only pin the current model and
 keep steering; this is not foreground fallback.
+
+The separate in-place **retry-hook steering** path (`session.retry` →
+`session.switchModel` without replay) stays active and follows each session's
+frozen binding: a child captured before a refresh keeps its captured fallback
+candidates, a child first captured afterwards uses the refreshed ones, and an
+empty/disabled bound chain never falls back to the startup chain. Delegate
+selection reads the latest published inference table.
 
 ## Background job state: rehydrate probe and persistence
 

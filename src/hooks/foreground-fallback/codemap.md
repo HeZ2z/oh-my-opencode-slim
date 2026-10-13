@@ -57,6 +57,17 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
   2. Current model (fallback) → search all chains for containing model
   3. Merged list (last resort) → preserve insertion order across all agents
 - **No cross-agent bleed**: When agent is identified, only that agent's chain is used (prevents re-prompting with wrong agent's models)
+- **Frozen session binding (v2)**: On v2 hosts `src/v2/setup.ts` installs a
+  three-state reader (`v2.setFallbackResolver` → `SessionFallbackBinding`,
+  cleared on disposal). A `bound-child` resolves to the candidates captured with
+  that child's inference entry (empty/disabled stays empty — never the startup
+  chain, and its variant is used for the switch request); a `pending-child`
+  (confirmed managed child without a successful capture) is not steered and the
+  host decision stands; every other session (root/foreign/unconfirmed) keeps the
+  startup-policy resolution above. A refresh therefore changes NEW children
+  only: an existing child keeps descending its captured candidates with its
+  tried/exhaustion state. v1 never installs the reader. A throwing reader fails
+  closed (no steering), never downgrading a bound child to the startup chain.
 
 ### Retryable Error Detection
 - **Pattern matching**: rate-limit/quota/outage/401/403/410/421/451 wording, content-policy moderation and OpenCode v1's content-filter finish error, transport codes (`ECONNRESET`, …) and transport messages
@@ -165,6 +176,9 @@ Log fallback event
 Fallback chains are provided as `Record<string, string[]>` where:
 - Key: Agent name (e.g., "orchestrator", "explorer")
 - Value: Ordered list of model strings (e.g., `["anthropic/claude-opus-4-5", "openai/gpt-4o"]`)
+- On v2 the startup chains are the refresh-built published inference table's
+  per-agent `fallbackChain`; a bound child uses the candidates frozen with its
+  capture instead of the mutable startup source.
 
 ### Memory Management
 - **Per-session state**: All maps cleared on `session.deleted` event
