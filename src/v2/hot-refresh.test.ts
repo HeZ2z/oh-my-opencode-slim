@@ -44,6 +44,10 @@ const CHAIN_XY = {
   companion: { enabled: false },
   agents: { explorer: { model: ['px/X', 'py/Y'] } },
 };
+const CHAIN_PQ = {
+  companion: { enabled: false },
+  agents: { explorer: { model: ['qa/P', 'qb/Q'] } },
+};
 const FAILOVER_ERROR = { message: 'rate limit exceeded' };
 
 const created = (sessionID: string, agent = 'explorer', parentID = 'p') => ({
@@ -76,6 +80,25 @@ async function waitFor(
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error('waitFor timed out');
     await wait(10);
+  }
+}
+
+/** Wait until `needle` appears at least `count` times in the plugin log. */
+async function waitForLogCount(
+  needle: string,
+  count: number,
+  options?: { optional?: boolean },
+): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    await flushLoggerForTesting();
+    const seen = pluginLogText().split(needle).length - 1;
+    if (seen >= count) return;
+    if (Date.now() > deadline) {
+      if (options?.optional) return;
+      throw new Error(`log '${needle}' did not reach ${count} occurrences`);
+    }
+    await wait(20);
   }
 }
 
@@ -693,17 +716,14 @@ describe('v2 hot-refresh integration: watcher, capture, delegation', () => {
     });
   }, 60_000);
 
-  test('setup returns before deferred finalize; a config edit before finalize never publishes an incomplete table', async () => {
+  test('a pre-finalize config edit is not lost: finalize publishes the latest valid inference and a new child uses it', async () => {
     env.writeProjectConfig(CHAIN_ABC);
-    const harness = await bootHarness(true, {
-      explorer: { model: { providerID: 'pa', id: 'A' } },
-    });
+    const harness = await bootHarness(true);
     try {
       // No publish before finalize (the builder refuses a partial roster).
       expect(sidebarModels().explorer).toBeUndefined();
       env.writeProjectConfig(CHAIN_XY);
-      // Wait for the OBSERVABLE refusal (registry not finalized) instead of a
-      // fixed sleep, so the assertion cannot pass before the watcher ran.
+      // Observe the refusal (the watcher consumed the event) before finalize.
       const refusalDeadline = Date.now() + 15_000;
       for (;;) {
         await flushLoggerForTesting();
@@ -715,14 +735,60 @@ describe('v2 hot-refresh integration: watcher, capture, delegation', () => {
       }
       expect(sidebarModels().explorer).toBeUndefined();
 
-      // Deferred finalize publishes the complete startup table from the host
-      // agent draft defaults, proving setup never awaited the callback.
+      // Finalize publishes the complete startup table AND consumes the deferred
+      // refresh with the latest disk config ([X,Y]) — no second write.
       harness.flushAgentTransform();
-      await waitFor(() => sidebarModels().explorer === 'pa/A');
+      await waitFor(() => sidebarModels().explorer === 'px/X');
+      expect(harness.agentReloadCalls()).toBe(0);
+
+      // A NEW child captured after finalize gets the refreshed chain X -> Y.
+      harness.sessionInfos.set('child-pending', {
+        parentID: 'p',
+        agent: 'explorer',
+      });
+      harness.pushEvent(created('child-pending'));
+      await waitFor(() => switchModels(harness, 'child-pending').length >= 1);
+      expect(switchModels(harness, 'child-pending')).toEqual([
+        { providerID: 'px', id: 'X' },
+      ]);
+      await retryFail(harness, 'child-pending', 'px', 'X');
+      expect(switchModels(harness, 'child-pending')).toEqual([
+        { providerID: 'px', id: 'X' },
+        { providerID: 'py', id: 'Y' },
+      ]);
+    } finally {
+      await harness.cleanup();
+    }
+  }, 30_000);
+
+  test('multiple pre-finalize edits: the latest on disk wins after finalize', async () => {
+    env.writeProjectConfig(CHAIN_ABC);
+    const harness = await bootHarness(true);
+    try {
+      env.writeProjectConfig(CHAIN_XY);
+      await waitForLogCount('agent registry not finalized', 1);
+      // A second edit before finalize; the latest on disk must win.
+      env.writeProjectConfig(CHAIN_PQ);
+      await waitForLogCount('agent registry not finalized', 2, {
+        optional: true,
+      });
+
+      harness.flushAgentTransform();
+      await waitFor(() => sidebarModels().explorer === 'qa/P');
       expect(harness.agentReloadCalls()).toBe(0);
     } finally {
       await harness.cleanup();
     }
+  }, 30_000);
+
+  test('disposing before finalize publishes nothing', async () => {
+    env.writeProjectConfig(CHAIN_ABC);
+    const harness = await bootHarness(true);
+    env.writeProjectConfig(CHAIN_XY);
+    await waitForLogCount('agent registry not finalized', 1);
+    // No flush: disposal retires the generation and its deferred transform.
+    await harness.cleanup();
+    expect(sidebarModels().explorer).toBeUndefined();
   }, 30_000);
 
   test('capture compares the ACTUAL host agent draft default, not a re-parsed plugin config', async () => {

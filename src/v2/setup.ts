@@ -2394,10 +2394,12 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       // v1 factory's `v2.refreshProfiles` hook BUILDS a complete inference
       // table via the same pure registry precedence (no commit) and the
       // runner PUBLISHES it via `v2.publishInference` after its abort check —
-      // one shared table reference, sidebar projected after the swap. The
-      // builder refuses until the registry is finalized, so no normal edit can
-      // publish a core-only table. Failure is honest: no swap, one logged
-      // cause.
+      // one shared table reference, sidebar projected after the swap. Before
+      // the registry is finalized the builder cannot know the complete roster,
+      // so it publishes nothing and defers: finalize re-reads disk once and
+      // publishes the latest valid inference (invalid config keeps the startup
+      // LKG), so an edit landing before finalize is not lost. Failure is
+      // honest: no swap, one logged cause.
       let readPublished: () => V2AgentRuntimeProfiles = () => ({});
       try {
         const extra = v1Hooks as unknown as {

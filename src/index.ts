@@ -568,6 +568,14 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
    */
   let publishedInference: V2InferenceTable['profiles'] | undefined;
   /**
+   * A watcher refresh arrived before the registry finalized (no complete
+   * roster yet), so it was refused rather than publishing a partial table.
+   * A single deferred marker (no queue/owner): finalize re-reads disk once and
+   * publishes the latest valid inference, or keeps the complete startup LKG
+   * when the config is still invalid.
+   */
+  let pendingRefreshRequested = false;
+  /**
    * Frozen marketplace activation snapshot captured at finalize: the selected
    * packages are loaded ONCE and the same readonly store feeds both the
    * initial registry build and every later inference re-resolution, so a
@@ -1895,6 +1903,19 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
             agentVariants: { ...resolvedAgentRegistry.tuiAgentVariants },
           },
         });
+        // Consume any refresh refused before finalize: now that the complete
+        // roster exists, re-read disk once and publish the latest valid
+        // inference (invalid/unchanged keeps the startup LKG). Runs inline in
+        // finalize so the first post-finalize capture already sees it; no
+        // queue, no generation owner, no setup await. A retired generation
+        // never publishes.
+        if (pendingRefreshRequested && !registryRetired && !instanceDisposed) {
+          pendingRefreshRequested = false;
+          const deferred = buildInferenceTable();
+          if (deferred.ok) publishInferenceTable(deferred.table);
+        } else {
+          pendingRefreshRequested = false;
+        }
       }
       return resolvedAgentRegistry;
     },
@@ -2007,11 +2028,20 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       }
       // A refresh must never publish a partial table: without the finalized
       // registry the roster/marketplace/appended aliases are unknown. Refuse
-      // (no publish) until finalize; the watcher logs the cause instead of
-      // seeding a core-only table. Setup never awaits this — finalize
-      // publishes the complete startup table itself.
+      // (no publish) until finalize and defer: finalize re-reads disk once and
+      // publishes the latest valid inference, so an edit before finalize is not
+      // lost. A disposed/retired generation never defers (nothing will catch
+      // up) and keeps the failure honest.
       if (!resolvedAgentRegistry) {
+        if (instanceDisposed || registryRetired) {
+          const reason = 'plugin generation is disposed';
+          log('[plugin] runtime profile refresh from disk failed', reason);
+          return { ok: false, reason };
+        }
         const reason = 'agent registry not finalized';
+        // Remember that a refresh was attempted before the roster existed so
+        // finalize can re-read disk and publish the latest valid inference.
+        pendingRefreshRequested = true;
         log('[plugin] runtime profile refresh from disk failed', reason);
         return { ok: false, reason };
       }

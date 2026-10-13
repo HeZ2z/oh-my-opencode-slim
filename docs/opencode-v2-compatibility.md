@@ -405,7 +405,11 @@ Config and preset edits hot-apply **only** as inference: for each agent, the
 variants), plus `temperature`/provider `options` and the sidebar projection.
 One fresh resolution builds the complete immutable table and one reference
 replacement publishes it; a malformed config is rejected before any swap and the
-last-known-good table/sidebar stay.
+last-known-good table/sidebar stay. A refresh that lands before the registry is
+finalized cannot see the complete roster, so it publishes nothing and is
+deferred: finalize re-reads disk once and publishes the latest valid inference
+(an invalid config keeps the last-known-good startup table), so an edit landing
+before finalize is not lost.
 
 Each plugin child freezes its whole agent entry — profile and fallback
 candidates together — on the FIRST successful capture. Capture runs on both the
