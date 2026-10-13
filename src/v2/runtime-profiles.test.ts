@@ -236,13 +236,16 @@ describe('createSessionProfileBridge', () => {
     expect(switchCalls).toHaveLength(2);
   });
 
-  test('bounded capture map evicts oldest entries', async () => {
+  test('retained live snapshots are never evicted (released only by delete)', async () => {
     const { bridge } = makeBridge();
     for (let index = 0; index < 1100; index += 1) {
       await bridge.observeEvent(created(`child-${index}`, 'oracle'));
     }
-    expect(bridge.size()).toBeLessThanOrEqual(1024);
-    expect(bridge.profileForSession('child-0')).toBeUndefined();
+    // Issue #1527: a long-idle live child must not be evicted and rebound
+    // to a newer chain — snapshots leave only via session.deleted.
+    expect(bridge.size()).toBe(1100);
+    expect(bridge.profileForSession('child-0')).toBeDefined();
+    expect(bridge.profileForSession('child-1099')).toBeDefined();
   });
 
   test('ensureSessionProfile resolves identity through session.get and awaits the switch', async () => {

@@ -28,6 +28,17 @@ export interface V2AgentRuntimeProfile {
    * absent from `providerOptions` are removed from the request so clearing a
    * preset field cannot leak the startup registry value into a new child. */
   managedProviderOptionKeys?: readonly string[];
+  /**
+   * Ordered fallback candidates frozen with the profile (issue #1527).
+   * Final wiring populates this for every bound profile; a captured entry
+   * without it reads as `startup-policy` (never a chain-less `bound-child`
+   * that would silently keep the startup read). An explicit (possibly
+   * empty) array is the bound chain for captured children — empty or
+   * `fallbackDisabled` never falls back to the startup chain.
+   */
+  fallbackChain?: ReadonlyArray<{ id: string; variant?: string }>;
+  /** Explicitly disabled fallback chain: bound children are not steered. */
+  fallbackDisabled?: boolean;
   sidebarModel: string;
   sidebarVariant?: string;
 }
@@ -37,7 +48,9 @@ export type V2AgentRuntimeProfiles = Record<string, V2AgentRuntimeProfile>;
 /** Per-session frozen profile (`null` = frozen with no applicable profile). */
 type FrozenProfile = V2AgentRuntimeProfile | null;
 
-/** Cap on per-session bookkeeping (FIFO eviction, mirrors the other v2 maps). */
+/** Cap on lifecycle-independent bookkeeping (ignored roots/foreign sessions
+ *  and deletion tombstones). Captured snapshots and awaiting-capture markers
+ *  are released by session lifecycle (capture/ignore/delete), never evicted. */
 const MAX_PROFILE_SESSIONS = 1024;
 const PROFILE_OPERATION_TIMEOUT_MS = 2_000;
 /** Bound for the request-path model switch. Rejecting (not proceeding) is
@@ -140,9 +153,43 @@ export interface SessionProfileBridge {
   ): Promise<void>;
   /** Frozen profile for a session (undefined when not captured). */
   profileForSession(sessionID: string): V2AgentRuntimeProfile | undefined;
-  /** Captured session count (bounded; test seam). */
+  /**
+   * Three-state fallback binding for a session (issue #1527, batch 1):
+   * - `bound-child`: captured entry with frozen `entries`/`disabled`;
+   *   an explicit (possibly empty) array is the bound chain, never the
+   *   startup chain. A captured legacy profile without candidate data
+   *   reads as `startup-policy` until wiring populates every profile.
+   * - `pending-child`: confirmed managed child without a successful capture
+   *   (in-flight or failed switch); do not steer, retain the host decision.
+   * - `startup-policy`: root/foreign/never-seen (or legacy snapshot without
+   *   candidate data); keep the original startup policy and isolation rules.
+   */
+  fallbackBindingForSession(
+    sessionID: string,
+  ): SessionFallbackBinding | undefined;
+  /** Captured session count (released via session.deleted; test seam). */
   size(): number;
 }
+
+/**
+ * Fallback binding for one session (issue #1527, batch 1). Discriminated
+ * union: `bound-child` always carries the frozen `entries` and `disabled`;
+ * `pending-child`/`startup-policy` carry no bound fields. A captured legacy
+ * profile without candidate data reads as `startup-policy` until wiring
+ * populates every bound profile (final wiring must populate all entries).
+ */
+export type SessionFallbackBinding =
+  | {
+      state: 'bound-child';
+      /** Agent the bound entry was captured for. */
+      agent?: string;
+      /** Frozen fallback candidates (possibly empty, never the startup chain). */
+      entries: ReadonlyArray<{ id: string; variant?: string }>;
+      /** Frozen disabled-chain flag. */
+      disabled: boolean;
+    }
+  | { state: 'pending-child' }
+  | { state: 'startup-policy' };
 
 /**
  * Freeze the current runtime profile for each newly seen plugin child session
@@ -163,21 +210,41 @@ export interface SessionProfileBridge {
 export function createSessionProfileBridge(
   options: SessionProfileBridgeOptions,
 ): SessionProfileBridge {
-  const captured = new Map<string, FrozenProfile>();
+  /**
+   * Per-session frozen snapshot: the agent the entry was captured for plus
+   * the frozen profile. Stored in the one existing capture map (an extension
+   * of existing state, not an independent registry): profile and fallback
+   * candidates freeze together, and a refresh never mutates a bound entry.
+   * Snapshots are released only via `session.deleted`; they are never
+   * pruned while the child is retained — a long-idle live child must not be
+   * evicted and rebound to a newer chain.
+   */
+  const captured = new Map<
+    string,
+    { agent?: string; profile: FrozenProfile }
+  >();
   /** Sessions proven to never qualify (root / foreign / non-plugin agent). */
   const ignored = new Set<string>();
   /** Deleted ids stay inert until a fresh session.created proves reuse. */
   const deleted = new Set<string>();
+  /**
+   * Confirmed managed children without a successful capture (in-flight
+   * captures live in `pending`; this set persists failed attempts so a
+   * retry is read as `pending-child`, never `startup-policy`). No
+   * independent generation owner/ID and no second session registry: entries
+   * are added only from the existing capture identity resolution and
+   * released on capture/ignore/delete — never evicted into `startup-policy`
+   * while the child is retained.
+   */
+  const awaitingCapture = new Set<string>();
   /** In-flight captures, so concurrent callers share one switch. */
   const pending = new Map<string, Promise<void>>();
   const emitLog = options.log ?? (() => {});
 
+  /** Bounded bookkeeping only for proven-non-child sessions and tombstones;
+   *  captured snapshots and awaiting-capture markers are lifecycle-managed
+   *  (released on capture/ignore/delete), never FIFO-evicted. */
   function prune(): void {
-    while (captured.size > MAX_PROFILE_SESSIONS) {
-      const oldest = captured.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      captured.delete(oldest);
-    }
     while (ignored.size > MAX_PROFILE_SESSIONS) {
       const oldest = ignored.values().next().value as string | undefined;
       if (oldest === undefined) break;
@@ -272,6 +339,7 @@ export function createSessionProfileBridge(
         if (resolved.authoritative) {
           // Proven root session: never profile it.
           ignored.add(sessionID);
+          awaitingCapture.delete(sessionID);
           prune();
           return;
         }
@@ -287,9 +355,13 @@ export function createSessionProfileBridge(
       if (!options.pluginAgents.has(resolved.agent)) {
         // Foreign-agent child: its sessions are never touched.
         ignored.add(sessionID);
+        awaitingCapture.delete(sessionID);
         prune();
         return;
       }
+      // Confirmed managed child: a later failure still reads as
+      // pending-child (host decision retained), never startup-policy.
+      awaitingCapture.add(sessionID);
 
       const profile = options.profiles()[resolved.agent];
       if (!profile) {
@@ -298,7 +370,8 @@ export function createSessionProfileBridge(
         // is built from createAgents, which has no marketplace handling).
         // Freeze null so admission proceeds on the host-registered model
         // with no temperature/options applied — never reject the prompt hook.
-        captured.set(sessionID, null);
+        captured.set(sessionID, { agent: resolved.agent, profile: null });
+        awaitingCapture.delete(sessionID);
         prune();
         emitLog('[v2][profile] child session captured without a profile', {
           sessionID,
@@ -314,7 +387,8 @@ export function createSessionProfileBridge(
           !sameModel(resolved.model, registered))
       ) {
         // Nothing to switch, or the host already runs a per-call model.
-        captured.set(sessionID, profile);
+        captured.set(sessionID, { agent: resolved.agent, profile });
+        awaitingCapture.delete(sessionID);
         prune();
         emitLog('[v2][profile] child session captured without a model switch', {
           sessionID,
@@ -338,7 +412,8 @@ export function createSessionProfileBridge(
         'session profile model switch timed out',
         options.switchTimeoutMs ?? PROFILE_SWITCH_TIMEOUT_MS,
       );
-      captured.set(sessionID, profile);
+      captured.set(sessionID, { agent: resolved.agent, profile });
+      awaitingCapture.delete(sessionID);
       prune();
       emitLog('[v2][profile] applied model to child session', {
         sessionID,
@@ -364,6 +439,8 @@ export function createSessionProfileBridge(
           if (typeof deletedID === 'string' && deletedID) {
             captured.delete(deletedID);
             ignored.delete(deletedID);
+            awaitingCapture.delete(deletedID);
+            pending.delete(deletedID);
             deleted.add(deletedID);
             prune();
           }
@@ -397,7 +474,40 @@ export function createSessionProfileBridge(
     },
 
     profileForSession(sessionID) {
-      return captured.get(sessionID) ?? undefined;
+      return captured.get(sessionID)?.profile ?? undefined;
+    },
+
+    fallbackBindingForSession(sessionID) {
+      if (typeof sessionID !== 'string' || !sessionID) return undefined;
+      const entry = captured.get(sessionID);
+      if (entry !== undefined) {
+        // Null = frozen with no applicable profile (e.g. marketplace
+        // agent): bound with an explicitly empty chain so the caller never
+        // falls back to the startup chain.
+        if (entry.profile === null) {
+          return {
+            state: 'bound-child',
+            ...(entry.agent ? { agent: entry.agent } : {}),
+            entries: [],
+            disabled: false,
+          };
+        }
+        // A captured legacy profile without candidate data reads as
+        // startup-policy until wiring populates every bound profile.
+        if (entry.profile.fallbackChain === undefined) {
+          return { state: 'startup-policy' };
+        }
+        return {
+          state: 'bound-child',
+          ...(entry.agent ? { agent: entry.agent } : {}),
+          entries: entry.profile.fallbackChain,
+          disabled: entry.profile.fallbackDisabled ?? false,
+        };
+      }
+      if (awaitingCapture.has(sessionID)) {
+        return { state: 'pending-child' };
+      }
+      return { state: 'startup-policy' };
     },
 
     size() {

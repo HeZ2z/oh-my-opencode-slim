@@ -377,6 +377,32 @@ function getProcessFallbacksInProgress(): Set<string> {
 export type ForegroundFallbackModel = string | { id: string; variant?: string };
 
 /**
+ * Frozen fallback binding for one session (issue #1527, batch 1).
+ * Supplied by the v2 session-profile bridge; v1 never sets it.
+ * Discriminated union: `bound-child` always carries the frozen `entries`
+ * and `disabled` (never the startup chain); `pending-child`/`startup-policy`
+ * carry no bound fields.
+ * - `bound-child`: descend `entries` (with the existing dynamic-head rule
+ *   for an observed model outside the candidates; empty stays empty).
+ * - `pending-child`: confirmed managed child without a successful capture;
+ *   do not steer, retain the host decision.
+ * - `startup-policy`: root/foreign/unconfirmed; original startup behavior.
+ */
+export type BoundFallbackSnapshot =
+  | {
+      state: 'bound-child';
+      agent?: string;
+      entries: ReadonlyArray<{ id: string; variant?: string }>;
+      disabled: boolean;
+    }
+  | { state: 'pending-child'; agent?: string }
+  | { state: 'startup-policy' };
+
+export type BoundFallbackResolver = (
+  sessionID: string,
+) => BoundFallbackSnapshot | undefined;
+
+/**
  * Manages runtime model fallback for foreground agent sessions.
  *
  * Constructed at plugin init with the ordered fallback chains for each agent
@@ -863,6 +889,11 @@ export class ForegroundFallbackManager {
      *  decision and calls session.switchModel, so it can run on v2 hosts.
      *  Defaults to `enabled` for hosts where both paths apply. */
     private readonly v2RetryEnabled: boolean = enabled,
+    /** Frozen fallback binding reader (issue #1527, batch 1). Wired on v2
+     *  hosts from the session-profile bridge; unset on v1 (and until the
+     *  bridge publishes inference tables), where the startup-chain read is
+     *  unchanged. Trailing optional so existing call sites are unaffected. */
+    private boundFallbackResolver?: BoundFallbackResolver,
   ) {
     this.chainSource = chains;
     for (const [agentName, entries] of Object.entries(chains)) {
@@ -912,6 +943,14 @@ export class ForegroundFallbackManager {
   /** Confirmed fallback serving this session, including provider failures. */
   getActiveFallback(sessionID: string) {
     return this.activeFallback.get(sessionID);
+  }
+
+  /**
+   * Install (or clear) the frozen fallback binding reader. Batch-1 seam:
+   * v2 setup will wire the session-profile bridge here; v1 never sets it.
+   */
+  setBoundFallbackResolver(resolver: BoundFallbackResolver | undefined): void {
+    this.boundFallbackResolver = resolver;
   }
 
   /** Restart the count with a new record so replies still being read are
@@ -1810,8 +1849,19 @@ export class ForegroundFallbackManager {
 
   /** A return to the OBSERVED configured primary starts a new descent. An
    *  inferred head, dynamic inherit+chain head, or committed fallback does
-   *  not count. */
+   *  not count. For a bound child the captured entries supply the configured
+   *  head (not the mutable startup table); a refresh alone cannot re-arm
+   *  because the captured head stays fixed. */
   private rearmIfFreshDescent(sessionID: string): void {
+    const snapshot = this.boundSnapshotFor(sessionID);
+    // A pending child has no chain to re-arm against, and a disabled bound
+    // chain has no head either.
+    if (
+      snapshot?.state === 'pending-child' ||
+      (snapshot?.state === 'bound-child' && snapshot.disabled)
+    ) {
+      return;
+    }
     const observedModel = this.sessionModel.get(sessionID);
     if (!observedModel) return;
     if (this.activeFallback.get(sessionID)?.model === observedModel) return;
@@ -1819,10 +1869,14 @@ export class ForegroundFallbackManager {
     if (!tried || tried.size <= 1) return;
     const agentName = this.sessionAgent.get(sessionID);
     const configuredChain =
-      agentName === undefined ? undefined : this.chains[agentName];
+      snapshot?.state === 'bound-child'
+        ? snapshot.entries.map((entry) => entry.id)
+        : agentName === undefined
+          ? undefined
+          : this.chains[agentName];
     const rearmHead =
       configuredChain?.[0] ??
-      this.resolveChain(agentName, observedModel).chain[0];
+      this.resolveChainForSession(sessionID, agentName, observedModel).chain[0];
     if (observedModel !== rearmHead) return;
     this.sessionTried.set(sessionID, new Set());
     this.sessionRetries.delete(sessionID);
@@ -1835,7 +1889,11 @@ export class ForegroundFallbackManager {
     const observedModel = this.sessionModel.get(sessionID);
     let currentModel = observedModel;
     const agentName = this.sessionAgent.get(sessionID);
-    const { chain, source } = this.resolveChain(agentName, currentModel);
+    const { chain, source, boundEntries } = this.resolveChainForSession(
+      sessionID,
+      agentName,
+      currentModel,
+    );
     // Callers pre-check via hasFallbackChain; keep as defensive guard only.
     if (!chain.length) return;
     // When the agent is known but no model was captured (common for
@@ -1932,8 +1990,9 @@ export class ForegroundFallbackManager {
       return;
     }
     const variant = source
-      ? this.chainEntries[source]?.find((entry) => entry.id === nextModel)
-          ?.variant
+      ? (boundEntries ?? this.chainEntries[source])?.find(
+          (entry) => entry.id === nextModel,
+        )?.variant
       : undefined;
     return { agentName, currentModel, nextModel, ref, variant };
   }
@@ -2329,11 +2388,84 @@ export class ForegroundFallbackManager {
   /** True when resolveChain yields at least one model for this session. */
   private hasFallbackChain(sessionID: string): boolean {
     return (
-      this.resolveChain(
+      this.resolveChainForSession(
+        sessionID,
         this.sessionAgent.get(sessionID),
         this.sessionModel.get(sessionID),
       ).chain.length > 0
     );
+  }
+
+  /**
+   * Read the frozen fallback binding for a session. A missing resolver (v1,
+   * or unwired v2) means startup-policy. A throwing resolver is a reader
+   * failure, never evidence for the old chain: log and fail closed (no
+   * steering) rather than downgrading a possibly-bound child to startup.
+   */
+  private boundSnapshotFor(
+    sessionID: string,
+  ): BoundFallbackSnapshot | undefined {
+    if (!this.boundFallbackResolver) return undefined;
+    try {
+      return this.boundFallbackResolver(sessionID);
+    } catch (err) {
+      log('[foreground-fallback] bound fallback reader failed; no steering', {
+        sessionID,
+        error: stringifyError(err),
+      });
+      return { state: 'pending-child' };
+    }
+  }
+
+  /**
+   * Session-aware chain resolution (issue #1527, batch 1). Bound children
+   * descend their captured entries with the same dynamic-head rule as the
+   * startup path (an observed model outside the candidates leads; empty
+   * chains stay empty) — never the mutable startup chain. Pending children
+   * resolve to an empty chain (no steering); everything else keeps the
+   * original startup-policy resolution below. v1 never sets the resolver,
+   * so v1 behavior is unchanged.
+   */
+  private resolveChainForSession(
+    sessionID: string,
+    agentName: string | undefined,
+    currentModel: string | undefined,
+  ): {
+    chain: string[];
+    source?: string;
+    boundEntries?: ReadonlyArray<{ id: string; variant?: string }>;
+  } {
+    const snapshot = this.boundSnapshotFor(sessionID);
+    if (snapshot?.state === 'pending-child') {
+      return { chain: [], source: snapshot.agent ?? agentName };
+    }
+    if (snapshot?.state === 'bound-child') {
+      if (snapshot.disabled) {
+        return { chain: [], source: snapshot.agent ?? agentName };
+      }
+      const ids = snapshot.entries.map((entry) => entry.id);
+      if (ids.length === 0) {
+        return {
+          chain: [],
+          source: snapshot.agent ?? agentName,
+          boundEntries: snapshot.entries,
+        };
+      }
+      // Dynamic head, mirroring resolveChain: the observed model leads the
+      // descent only when it sits outside the captured candidates. The head
+      // carries no variant; selectFallbackModel marks it tried before
+      // scanning, so the scan starts at the captured head.
+      const chain =
+        currentModel && !ids.includes(currentModel)
+          ? [currentModel, ...ids]
+          : ids;
+      return {
+        chain,
+        source: snapshot.agent ?? agentName,
+        boundEntries: snapshot.entries,
+      };
+    }
+    return this.resolveChain(agentName, currentModel);
   }
 
   /**
