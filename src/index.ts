@@ -4,13 +4,10 @@ import {
   acquireAdmissionRuntime,
 } from './admission-runtime';
 import {
-  type AgentModelProjection,
-  type AgentRuntimeProfiles,
   createAgents,
   getAgentConfigsFromDefinitions,
+  inferenceProfilesFromRegistry,
   isSubagent,
-  mergeHostAgentConfigs,
-  projectAgentRuntimeState,
   resolvePrimaryModelValue,
 } from './agents';
 import { buildOrchestratorPrompt } from './agents/orchestrator';
@@ -27,7 +24,7 @@ import {
   normalizeCompanionSessionStatus,
 } from './companion/manager';
 import { ensureCompanionVersion } from './companion/updater';
-import { deepMerge, loadPluginConfig, type Preset } from './config';
+import { deepMerge, loadPluginConfig } from './config';
 import {
   DEFAULT_MAX_SESSION_METADATA_ENTRIES,
   SMARTFETCH_SECONDARY_SESSION_TITLE,
@@ -38,6 +35,7 @@ import { RuntimeConfig } from './config/runtime';
 import { getBuildInfo } from './generated/build-info';
 import { HEALTH_CHECK, minimumExpectedToolCount } from './health-check';
 import {
+  type BoundFallbackResolver,
   COUNCIL_INJECT_METADATA_KEY,
   createAbsolutePathRescueHook,
   createApplyPatchHook,
@@ -93,6 +91,7 @@ import {
 } from './hooks/types';
 import { createInterviewManager } from './interview';
 import { collapseInterviewHistory } from './interview/history';
+import type { MarketplaceActivationStore } from './marketplace/activation';
 import { discoverPreflightSkills } from './marketplace/preflight';
 import { MarketplaceService } from './marketplace/service';
 import { resolveDesiredMarketplacePackageIds } from './marketplace/status';
@@ -192,6 +191,10 @@ import {
   isInternalAdmission,
   recordInternalAdmission,
 } from './v2/internal-admissions';
+import {
+  reconcileRuntimeProfileOptionKeys,
+  type V2InferenceTable,
+} from './v2/runtime-profiles';
 
 /**
  * Best-effort log to opencode's app logger.
@@ -236,7 +239,7 @@ type DelegatedModelSelection = {
  */
 function selectDelegatedModel(input: {
   agentName: string;
-  childChain: ModelChainEntry[] | undefined;
+  childChain: ReadonlyArray<ModelChainEntry> | undefined;
   followsParent: boolean;
   parentModel: string | undefined;
   activeFallback: ReturnType<ForegroundFallbackManager['getActiveFallback']>;
@@ -271,18 +274,28 @@ function selectDelegatedModel(input: {
 // of the config file's preset. State lives in RuntimeConfig.
 
 /**
- * Result of the v2-only `v2.refreshProfiles` hook. `ok: true` carries the
- * freshly resolved inference profiles plus the sidebar projection that was
- * already written; `ok: false` carries the failure reason and guarantees no
- * state was swapped.
+ * Result of the v2-only `v2.refreshProfiles` hook. The builder resolves a
+ * complete inference table and commits nothing: `ok: true` carries the fresh
+ * table (profiles with frozen fallback candidates for the full finalized
+ * roster, per-profile inheritance, sidebar projection); `ok: false` carries the
+ * failure reason and guarantees no state was built or swapped. The runner
+ * publishes via `v2.publishInference` (swap + sidebar projection) only after
+ * its own abort check.
  */
 export type V2ProfileRefreshResult =
-  | {
-      ok: true;
-      profiles: AgentRuntimeProfiles;
-      projection: AgentModelProjection;
-    }
+  | { ok: true; table: V2InferenceTable }
   | { ok: false; reason: string };
+
+/** Result of the v2-only `v2.publishInference` hook (runner apply): the
+ *  reconciled, published profiles (the single shared table reference the
+ *  bridge and delegation read) plus whether the post-publish sidebar
+ *  projection write succeeded. A projection failure never rolls back the
+ *  published memory table; the next publish rewrites the latest projection.
+ */
+export interface V2PublishedInference {
+  profiles: V2InferenceTable['profiles'];
+  sidebarOk: boolean;
+}
 
 /**
  * Config-load warning kinds that make a live profile refresh a hard failure.
@@ -545,6 +558,35 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   let chatHeadersHook: ReturnType<typeof createChatHeadersHook> | undefined;
   let foregroundFallback: ForegroundFallbackManager;
   let foregroundFallbackChains: Record<string, ForegroundFallbackModel[]> = {};
+  /**
+   * The single current inference generation (issue #1527): published
+   * profiles carry their own frozen fallback candidates + inheritance, so
+   * capture, steering, and v2 delegation share one immutable reference. The
+   * builder constructs the table, `v2.publishInference` swaps this, and the
+   * sidebar projects it afterwards. Undefined until startup finalize
+   * publishes — never a core-only pre-finalize seed.
+   */
+  let publishedInference: V2InferenceTable['profiles'] | undefined;
+  /**
+   * Frozen marketplace activation snapshot captured at finalize: the selected
+   * packages are loaded ONCE and the same readonly store feeds both the
+   * initial registry build and every later inference re-resolution, so a
+   * package installed/removed/replaced after startup can never leak into a
+   * refresh (frozen roster/installed content, no install/reload/session layer).
+   */
+  let frozenMarketplaceStore: MarketplaceActivationStore | undefined;
+  /**
+   * Frozen registered roster/identities captured at finalize: the published
+   * table is restricted to these keys, so a config edit that changes
+   * `disabled_agents` or `displayName` cannot add new agent keys or drop
+   * host-registered ones (no hot registry reload).
+   */
+  let frozenInferenceRoster:
+    | {
+        keys: string[];
+        identities: Record<string, string>;
+      }
+    | undefined;
   let selectedMarketplacePackageIds: readonly string[] = [];
   let deepworkCommandHook: ReturnType<typeof createDeepworkCommandHook>;
   let deepworkGuardHook: ReturnType<typeof createDeepworkGuardHook>;
@@ -663,12 +705,25 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   ): DelegatedModelSelection | undefined => {
     if (!parentSessionID) return undefined;
     const agentName = resolveRuntimeAgentName(runtime, agentType);
-    const inheritance = runtime.agent(agentName)?.inheritModelFrom;
+    // v2 reads the latest published inference generation (issue #1527): the
+    // refresh-published candidates/inheritance, never the startup
+    // `runtime.modelArrays`. When a published table exists its entry is
+    // authoritative — an absent chain/inheritance stays absent, so a refresh
+    // that removed a chain or inheritance cannot revive the startup value. v1
+    // and pre-publish states keep the original startup read.
+    const published = hostFlavor === 'v2' ? publishedInference : undefined;
+    const publishedProfile = published?.[agentName];
+    const childChain = published
+      ? (publishedProfile?.fallbackChain ?? [])
+      : runtime.modelArrays[agentName];
+    const inheritance = published
+      ? publishedProfile?.inheritModelFrom
+      : runtime.agent(agentName)?.inheritModelFrom;
     const followsParent =
       inheritance === 'orchestrator' || inheritance === 'session';
     return selectDelegatedModel({
       agentName,
-      childChain: runtime.modelArrays[agentName],
+      childChain,
       followsParent,
       // External-selection metadata deliberately ignores internal fallback
       // replays (#1079). Delegation needs the opposite view: the model
@@ -1757,6 +1812,26 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       }
       if (!resolvedAgentRegistry) {
         RuntimeConfig.get(ctx.directory).captureHostConfig(hostSnapshot);
+        // Freeze the selected marketplace packages exactly once, so the
+        // initial registry AND later inference re-resolution read the same
+        // installed content (no activation side effects, no host reload).
+        const marketplaceSnapshot = marketplaceService.store.loadSelected(
+          selectedMarketplacePackageIds,
+        );
+        frozenMarketplaceStore = {
+          loadSelected: (ids) => ({
+            packages: new Map(
+              [...marketplaceSnapshot.packages].filter(([id]) =>
+                ids.includes(id),
+              ),
+            ),
+            errors: new Map(
+              [...marketplaceSnapshot.errors].filter(([id]) =>
+                ids.includes(id),
+              ),
+            ),
+          }),
+        };
         resolvedAgentRegistry = buildResolvedAgentRegistry(runtime, {
           hostSnapshot,
           definitions: agentDefs,
@@ -1766,7 +1841,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           nativePermissionsByAgent,
           marketplace: {
             selectedPackageIds: selectedMarketplacePackageIds,
-            store: marketplaceService.store,
+            store: frozenMarketplaceStore,
             pluginVersion: getBuildInfo().version,
             availableSkillNames: selectedMarketplacePackageIds.length
               ? discoverPreflightSkills(runtime, ctx.directory)
@@ -1797,6 +1872,29 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
             foregroundFallback.disableChain(agentName);
           }
         }
+        // Complete startup table (issue #1527): the finalized roster's
+        // inference + candidates + inheritance is published as one shared
+        // reference, formatted directly from the just-built registry (no
+        // second resolution). Capture and delegation read nothing before
+        // this, so a core-only pre-finalize state can never be captured or
+        // delegated from. The published key set and identities are frozen
+        // here and reused by every refresh.
+        const startupProfiles = inferenceProfilesFromRegistry({
+          candidates: resolvedAgentRegistry,
+          freshRuntime: runtime,
+          liveRuntime: runtime,
+        });
+        frozenInferenceRoster = {
+          keys: Object.keys(startupProfiles),
+          identities: { ...resolvedAgentRegistry.identities },
+        };
+        publishInferenceTable({
+          profiles: startupProfiles,
+          projection: {
+            agentModels: { ...resolvedAgentRegistry.tuiAgentModels },
+            agentVariants: { ...resolvedAgentRegistry.tuiAgentVariants },
+          },
+        });
       }
       return resolvedAgentRegistry;
     },
@@ -1853,31 +1951,38 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   /**
    * Re-read the plugin config from disk and resolve ONLY the
    * inference/runtime profile fields (model, variant, temperature, provider
-   * options) for each agent, plus the sidebar model projection. The v2
-   * adapter consumes this through the `v2.refreshProfiles` hook when a
-   * watched config file changes or a preset is applied.
+   * options) for each agent across the finalized roster, plus the sidebar
+   * model projection. The v2 adapter consumes this through the
+   * `v2.refreshProfiles` hook when a watched config file changes or a preset
+   * is applied, then publishes it via `v2.publishInference`.
    *
    * This is deliberately NOT a global agent reload: the session-frozen
    * surfaces (agent definitions, prompts, tools, permissions, skills, MCPs)
-   * are never rebuilt and the host agent registry is never reloaded. It is
-   * read-only on factory-local state — a throwaway `RuntimeConfig.create`
-   * view resolves the fresh file against the captured host layer, so running
-   * generation state (`config`, `runtime`, `agentDefs`, `agents`,
-   * `finalHostAgentConfig`) is untouched. New child sessions receive the
-   * refreshed inference fields through the v2 session-profile bridge; the
-   * sidebar is rewritten through the existing `recordTuiAgentModels` writer.
+   * are never rebuilt and the host agent registry is never reloaded or
+   * re-activated. It is read-only on factory-local state — a throwaway
+   * `RuntimeConfig.create` view resolves the fresh file against the captured
+   * host layer, so running generation state (`config`, `runtime`, `agentDefs`,
+   * `agents`, `finalHostAgentConfig`) is untouched. The frozen registry only
+   * supplies roster/candidate data (marketplace agents, display aliases); core
+   * agents always take their chain from the fresh config.
    *
-   * Returns a discriminated result; a failure never claims success and never
-   * swaps state (the caller decides what to do with the reason). A config
-   * load that produced `invalid-json`/`invalid-schema`/`read-error` warnings
-   * is a hard failure: the loader would otherwise fall back to `{}` and the
-   * "refresh" would report ok while wiping every profile/agent model.
+   * The builder commits NOTHING: it returns a complete table (`ok: true`) or a
+   * failure reason (`ok: false`). The sidebar is projected by
+   * `v2.publishInference` after the runner's abort check. A config load that
+   * produced `invalid-json`/`invalid-schema`/`read-error` warnings is a hard
+   * failure: the loader would otherwise fall back to `{}` and the "refresh"
+   * would report ok while wiping every profile/agent model.
    */
-  const refreshProfilesFromDisk = async (options?: {
+  const buildInferenceTable = (options?: {
     /** Startup has no last-good table yet; use the loader's normal fallback
      * config so malformed user input remains non-fatal for this generation. */
     allowInvalidFallback?: boolean;
-  }): Promise<V2ProfileRefreshResult> => {
+  }):
+    | {
+        ok: true;
+        table: V2InferenceTable;
+      }
+    | { ok: false; reason: string } => {
     try {
       // Malformed config handling: collect warnings and abort BEFORE any
       // resolution or sidebar rewrite when the load is invalid. The loader
@@ -1900,6 +2005,16 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         log('[plugin] runtime profile refresh from disk failed', reason);
         return { ok: false, reason };
       }
+      // A refresh must never publish a partial table: without the finalized
+      // registry the roster/marketplace/appended aliases are unknown. Refuse
+      // (no publish) until finalize; the watcher logs the cause instead of
+      // seeding a core-only table. Setup never awaits this — finalize
+      // publishes the complete startup table itself.
+      if (!resolvedAgentRegistry) {
+        const reason = 'agent registry not finalized';
+        log('[plugin] runtime profile refresh from disk failed', reason);
+        return { ok: false, reason };
+      }
       const freshRuntime = RuntimeConfig.create(ctx.directory, freshConfig);
       const hostSnapshot = runtime.host();
       if (hostSnapshot) {
@@ -1908,61 +2023,119 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // Mirror factory init: a persisted runtime preset (in-session switch)
       // survives the reload and wins over the config-file preset.
       const runtimePresetName = runtime.getRuntimePreset();
-      let runtimePreset: Preset | undefined;
       if (runtimePresetName && freshConfig.presets?.[runtimePresetName]) {
         freshRuntime.setRuntimePreset(runtimePresetName);
-        runtimePreset = freshConfig.presets[runtimePresetName] as Preset;
       }
       const freshAgentDefs = createAgents(freshRuntime, {
         projectDirectory: ctx.directory,
         hostFlavor,
       });
-      const freshAgents = getAgentConfigsFromDefinitions(
-        freshRuntime,
-        freshAgentDefs,
-      );
-      const mergedAgents = mergeHostAgentConfigs(
-        freshAgents as Record<string, Record<string, unknown>>,
-        hostSnapshot?.agent,
-      );
-      const { profiles, projection } = projectAgentRuntimeState({
-        runtime: freshRuntime,
-        agentDefs: freshAgentDefs,
-        agentConfigs: mergedAgents,
-        runtimePreset,
-      });
-      // Sidebar projection must land before the profiles are reported as
-      // refreshed (the caller swaps only on an ok result).
-      //
-      // The refresh resolves inference fields for the core agent set only:
-      // `createAgents()` is marketplace-unaware, while the finalized registry
-      // is the authoritative roster and already includes marketplace agents.
-      // Union the fresh projection over the registry projection so a startup
-      // or watcher refresh cannot shrink the roster and drop marketplace
-      // agents from the sidebar; fresh core models still win.
-      const registry = resolvedAgentRegistry;
-      recordTuiAgentModels(
-        {
-          agentModels: {
-            ...(registry?.tuiAgentModels ?? {}),
-            ...projection.agentModels,
-          },
-          agentVariants: {
-            ...(registry?.tuiAgentVariants ?? {}),
-            ...projection.agentVariants,
-          },
+      // Recompute the FULL inference table through the SAME pure registry
+      // precedence used at finalize: fresh definitions/config + the frozen
+      // marketplace roster/installed packages (same selected ids + frozen
+      // store; resolveMarketplaceActivation has no activation side effects and
+      // no host agent reload or permission/tool change — the recomputed
+      // registry's non-inference surfaces are discarded).
+      const freshRegistry = buildResolvedAgentRegistry(freshRuntime, {
+        hostSnapshot: hostSnapshot ?? {},
+        definitions: freshAgentDefs,
+        projectDirectory: ctx.directory,
+        hostFlavor,
+        pluginMcps: mcps,
+        nativePermissionsByAgent: latestNativePermissionsByAgent,
+        marketplace: {
+          selectedPackageIds: selectedMarketplacePackageIds,
+          store: frozenMarketplaceStore ?? marketplaceService.store,
+          pluginVersion: getBuildInfo().version,
+          availableSkillNames: selectedMarketplacePackageIds.length
+            ? discoverPreflightSkills(freshRuntime, ctx.directory)
+            : [],
         },
-        ctx.directory,
-      );
-      log('[plugin] runtime profiles refreshed from disk', {
-        agents: Object.keys(profiles).length,
       });
-      return { ok: true, profiles, projection };
+      // Keep the frozen identities (a fresh displayName edit must not add or
+      // rename published keys) and restrict the table to the frozen roster,
+      // backfilling a frozen key whose fresh inference is absent (e.g. an
+      // agent disabled in the fresh config) from the last published entry so
+      // a host-registered agent is never dropped.
+      const formatted = inferenceProfilesFromRegistry({
+        candidates: frozenInferenceRoster
+          ? { ...freshRegistry, identities: frozenInferenceRoster.identities }
+          : freshRegistry,
+        freshRuntime,
+        liveRuntime: runtime,
+      });
+      const rosterKeys = frozenInferenceRoster?.keys;
+      const profiles: V2InferenceTable['profiles'] = {};
+      if (rosterKeys) {
+        for (const key of rosterKeys) {
+          const entry = formatted[key] ?? publishedInference?.[key];
+          if (entry) profiles[key] = entry;
+        }
+      } else {
+        Object.assign(profiles, formatted);
+      }
+      const projection = {
+        agentModels: Object.fromEntries(
+          Object.entries(profiles).map(([name, profile]) => [
+            name,
+            profile.sidebarModel,
+          ]),
+        ),
+        agentVariants: Object.fromEntries(
+          Object.entries(profiles).flatMap(([name, profile]) =>
+            profile.sidebarVariant === undefined
+              ? []
+              : [[name, profile.sidebarVariant]],
+          ),
+        ),
+      };
+      return { ok: true, table: { profiles, projection } };
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       log('[plugin] runtime profile refresh from disk failed', reason);
       return { ok: false, reason };
     }
+  };
+
+  const refreshProfilesFromDisk = async (options?: {
+    allowInvalidFallback?: boolean;
+  }): Promise<V2ProfileRefreshResult> => buildInferenceTable(options);
+
+  /**
+   * Publish one built inference table (runner apply): reconcile the managed
+   * provider-option keys against the previous generation, swap the single
+   * shared `publishedInference` reference, then project the sidebar. A
+   * sidebar write failure is logged but never rolls back the memory table —
+   * the next publish rewrites the latest projection (no retry queue).
+   */
+  const publishInferenceTable = (
+    table: V2InferenceTable,
+  ): V2PublishedInference => {
+    const reconciled = reconcileRuntimeProfileOptionKeys(
+      publishedInference ?? {},
+      table.profiles,
+    );
+    publishedInference = reconciled;
+    // Publish the CURRENT full projection directly: it already covers the
+    // whole frozen roster, so a variant/model the fresh config removed must
+    // not fall back to a stale entry from an older registry projection.
+    const sidebarOk = recordTuiAgentModels(
+      {
+        agentModels: { ...table.projection.agentModels },
+        agentVariants: { ...table.projection.agentVariants },
+      },
+      ctx.directory,
+    );
+    if (!sidebarOk) {
+      log('[plugin] inference published; sidebar projection failed', {
+        agents: Object.keys(reconciled).length,
+      });
+    } else {
+      log('[plugin] runtime profiles refreshed from disk', {
+        agents: Object.keys(reconciled).length,
+      });
+    }
+    return { profiles: reconciled, sidebarOk };
   };
 
   // Only the v2 bridge consumes this native provider/model#variant override.
@@ -2003,6 +2176,19 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     // inference/runtime profiles for new child sessions + the sidebar.
     // Unknown to v1 hosts, consumed by src/v2/setup.ts.
     'v2.refreshProfiles': refreshProfilesFromDisk,
+    // v2-only publish/read pair (issue #1527): the runner apply swaps the
+    // single published table reference and projects the sidebar; the setup
+    // bridge and delegation read that reference. No generation id.
+    'v2.publishInference': publishInferenceTable,
+    'v2.readPublishedInference': () => publishedInference,
+    // v2 setup wires the session-profile bridge's three-state reader here so
+    // the fallback manager descends a bound child's captured candidates; it
+    // clears the resolver on disposal (no dangling bridge reference).
+    'v2.setFallbackResolver': (
+      resolver: BoundFallbackResolver | undefined,
+    ): void => {
+      foregroundFallback.setBoundFallbackResolver(resolver);
+    },
     'v2.foreignTaskEvent': observeForeignTaskEvent,
     'v2.resolveDelegatedModel': resolveV2DelegatedModel,
     // Per-instance background-default flip handle: v2 setup arms it after

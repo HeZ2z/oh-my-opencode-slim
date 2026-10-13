@@ -472,8 +472,11 @@ describe('watchPluginConfigFiles scheduling', () => {
 });
 
 describe('createProfileRefreshRunner', () => {
-  const profiles = {
-    explorer: { sidebarModel: 'openai/gpt-5-mini' },
+  const table = {
+    profiles: {
+      explorer: { sidebarModel: 'openai/gpt-5-mini' },
+    },
+    projection: { agentModels: {}, agentVariants: {} },
   };
 
   /** Runner harness: the default apply counts, the default log captures. */
@@ -502,7 +505,7 @@ describe('createProfileRefreshRunner', () => {
 
   test('applies resolved profiles and logs success once', async () => {
     const { runner, logs, applied } = startRunner({
-      refresh: async () => ({ ok: true, profiles }),
+      refresh: async () => ({ ok: true, table }),
     });
 
     await runner(new AbortController().signal);
@@ -528,7 +531,7 @@ describe('createProfileRefreshRunner', () => {
     const { runner, applied } = startRunner({
       refresh: async () => {
         controller.abort();
-        return { ok: true, profiles };
+        return { ok: true, table };
       },
     });
 
@@ -544,7 +547,7 @@ describe('createProfileRefreshRunner', () => {
     const { runner } = startRunner({
       refresh: async () => {
         refreshes += 1;
-        return { ok: true, profiles };
+        return { ok: true, table };
       },
     });
 

@@ -15,6 +15,8 @@ import {
   createAgents,
   getAgentConfigs,
   getAgentConfigsFromDefinitions,
+  type InferenceCandidateSource,
+  inferenceProfilesFromRegistry,
   isSubagent,
   mergeHostAgentConfigs,
   projectAgentRuntimeState,
@@ -125,6 +127,111 @@ describe('hot-refreshed runtime profiles', () => {
       temperature: 0.8,
       providerOptions: { visible: true },
     });
+  });
+});
+
+describe('inferenceProfilesFromRegistry (issue #1527)', () => {
+  /** Minimal candidate source with a name → display identity pair. */
+  function source(overrides?: Partial<InferenceCandidateSource>) {
+    const base: InferenceCandidateSource = {
+      modelCandidates: {
+        explorer: [{ id: 'pa/A' }, { id: 'pb/B', variant: 'max' }],
+      },
+      agentNames: ['explorer'],
+      identities: { explorer: 'advisor' },
+      effectiveStartupModels: {
+        explorer: { model: 'pa/A' },
+      },
+      tuiAgentModels: { explorer: 'pa/A' },
+      tuiAgentVariants: {},
+      finalAgentConfig: {
+        explorer: { temperature: 0.25, options: { thinking: true } },
+      },
+    };
+    return { ...base, ...overrides };
+  }
+
+  test('mirrors FULL inference (model/temp/options/variant/chain/inherit) to display and legacy aliases', () => {
+    const runtime = runtimeFor({
+      agents: { explorer: { inheritModelFrom: 'session' } },
+    });
+
+    const profiles = inferenceProfilesFromRegistry({
+      candidates: source(),
+      freshRuntime: runtime,
+      liveRuntime: runtime,
+    });
+
+    const canonical = profiles.explorer;
+    expect(canonical?.model).toEqual({ providerID: 'pa', id: 'A' });
+    expect(canonical?.fallbackChain).toEqual([
+      { id: 'pa/A' },
+      { id: 'pb/B', variant: 'max' },
+    ]);
+    expect(canonical?.inheritModelFrom).toBe('session');
+    expect(canonical?.temperature).toBe(0.25);
+    expect(canonical?.providerOptions).toEqual({ thinking: true });
+    expect(canonical?.sidebarModel).toBe('pa/A');
+
+    // Display alias and the legacy AGENT_ALIASES spelling ('explore') carry
+    // the SAME resolved inference, not just the chain/inherit subset.
+    for (const alias of ['advisor', 'explore']) {
+      expect(profiles[alias]?.model).toEqual(canonical?.model);
+      expect(profiles[alias]?.fallbackChain).toEqual(canonical?.fallbackChain);
+      expect(profiles[alias]?.inheritModelFrom).toBe('session');
+      expect(profiles[alias]?.temperature).toBe(0.25);
+      expect(profiles[alias]?.providerOptions).toEqual({ thinking: true });
+      expect(profiles[alias]?.sidebarModel).toBe('pa/A');
+    }
+  });
+
+  test('a model-less registered default stays model-less (chain head not substituted)', () => {
+    const runtime = runtimeFor({
+      agents: { explorer: { inheritModelFrom: 'session' } },
+    });
+
+    const profiles = inferenceProfilesFromRegistry({
+      candidates: source({
+        effectiveStartupModels: { explorer: {} },
+        modelCandidates: { explorer: [{ id: 'pa/A' }, { id: 'pb/B' }] },
+      }),
+      freshRuntime: runtime,
+      liveRuntime: runtime,
+    });
+
+    expect(profiles.explorer?.model).toBeUndefined();
+    expect(profiles.explorer?.inheritModelFrom).toBe('session');
+  });
+
+  test('single/zero candidate chains publish an explicit empty chain', () => {
+    const runtime = runtimeFor({ agents: { explorer: { model: 'pa/A' } } });
+
+    const profiles = inferenceProfilesFromRegistry({
+      candidates: source({
+        modelCandidates: { explorer: [{ id: 'pa/A' }] },
+      }),
+      freshRuntime: runtime,
+      liveRuntime: runtime,
+    });
+
+    expect(profiles.explorer?.fallbackChain).toEqual([]);
+    expect(profiles.explorer?.fallbackDisabled).toBe(false);
+  });
+
+  test('an explicit one-entry model array is preserved as a chain', () => {
+    // Configured as an array of one: observed Z against [A] is a legitimate
+    // dynamic-head descent, so the entry must remain a chain.
+    const runtime = runtimeFor({ agents: { explorer: { model: ['pa/A'] } } });
+
+    const profiles = inferenceProfilesFromRegistry({
+      candidates: source({
+        modelCandidates: { explorer: [{ id: 'pa/A' }] },
+      }),
+      freshRuntime: runtime,
+      liveRuntime: runtime,
+    });
+
+    expect(profiles.explorer?.fallbackChain).toEqual([{ id: 'pa/A' }]);
   });
 });
 

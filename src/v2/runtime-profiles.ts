@@ -39,11 +39,33 @@ export interface V2AgentRuntimeProfile {
   fallbackChain?: ReadonlyArray<{ id: string; variant?: string }>;
   /** Explicitly disabled fallback chain: bound children are not steered. */
   fallbackDisabled?: boolean;
+  /**
+   * Model source this agent inherits from (issue #1527), frozen with the
+   * profile entry. Absence is meaningful: a refresh that removes inheritance
+   * must not let delegation revive stale startup inheritance.
+   */
+  inheritModelFrom?: string;
   sidebarModel: string;
   sidebarVariant?: string;
 }
 
 export type V2AgentRuntimeProfiles = Record<string, V2AgentRuntimeProfile>;
+
+/**
+ * One published inference generation (issue #1527): the current
+ * profiles (each entry carrying its own inference + inheritance + fallback
+ * candidates), and the sidebar projection resolved with them. The factory
+ * owns the single reference; the builder constructs it, publish swaps it,
+ * and the sidebar projects it afterwards. No separate generation owner or
+ * session map.
+ */
+export interface V2InferenceTable {
+  profiles: V2AgentRuntimeProfiles;
+  projection: {
+    agentModels: Record<string, string>;
+    agentVariants: Record<string, string>;
+  };
+}
 
 /** Per-session frozen profile (`null` = frozen with no applicable profile). */
 type FrozenProfile = V2AgentRuntimeProfile | null;
@@ -154,7 +176,7 @@ export interface SessionProfileBridge {
   /** Frozen profile for a session (undefined when not captured). */
   profileForSession(sessionID: string): V2AgentRuntimeProfile | undefined;
   /**
-   * Three-state fallback binding for a session (issue #1527, batch 1):
+   * Three-state fallback binding for a session (issue #1527):
    * - `bound-child`: captured entry with frozen `entries`/`disabled`;
    *   an explicit (possibly empty) array is the bound chain, never the
    *   startup chain. A captured legacy profile without candidate data
@@ -172,7 +194,7 @@ export interface SessionProfileBridge {
 }
 
 /**
- * Fallback binding for one session (issue #1527, batch 1). Discriminated
+ * Fallback binding for one session (issue #1527). Discriminated
  * union: `bound-child` always carries the frozen `entries` and `disabled`;
  * `pending-child`/`startup-policy` carry no bound fields. A captured legacy
  * profile without candidate data reads as `startup-policy` until wiring

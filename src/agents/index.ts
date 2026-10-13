@@ -328,11 +328,24 @@ export interface AgentModelProjection {
  * Inference/runtime fields of one agent that may hot-apply to NEW child
  * sessions plus the sidebar. Everything else (prompt, tools, permissions,
  * skills, MCPs, description) stays frozen for a session's lifetime.
+ *
+ * `fallbackChain`/`fallbackDisabled` are populated by
+ * `attachInferenceCandidates` for every finalized-roster entry (issue
+ * #1527): an explicit (possibly empty) chain is the bound descent for newly
+ * captured children and never the startup chain.
  */
 export interface AgentRuntimeProfile {
   model?: { providerID: string; id: string; variant?: string };
   temperature?: number;
   providerOptions?: Record<string, unknown>;
+  fallbackChain?: Array<{ id: string; variant?: string }>;
+  fallbackDisabled?: boolean;
+  /**
+   * Model source this agent inherits from, frozen with the profile entry
+   * (issue #1527). Absence is meaningful: removing inheritance must not let
+   * a refresher/consumer revive stale startup inheritance.
+   */
+  inheritModelFrom?: string;
   sidebarModel: string;
   sidebarVariant?: string;
 }
@@ -568,6 +581,140 @@ export function projectAgentRuntimeState(input: {
   });
 
   return { profiles, projection };
+}
+
+/**
+ * Minimal candidate/roster surface of a resolved agent registry (issue
+ * #1527). Satisfied by `ResolvedAgentRegistry`. The registry is the single
+ * resolution authority: `inferenceProfilesFromRegistry` formats its already
+ * resolved precedence (host override, preset, inheritance, marketplace model
+ * policy) into the published table — no bespoke merge.
+ */
+export interface InferenceCandidateSource {
+  readonly modelCandidates: Readonly<
+    Record<string, ReadonlyArray<{ id: string; variant?: string }>>
+  >;
+  readonly agentNames: ReadonlyArray<string>;
+  readonly identities: Readonly<Record<string, string>>;
+  readonly effectiveStartupModels: Readonly<
+    Record<string, { model?: string; variant?: string }>
+  >;
+  readonly tuiAgentModels: Readonly<Record<string, string>>;
+  readonly tuiAgentVariants: Readonly<Record<string, string>>;
+  readonly finalAgentConfig: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * Format a resolved agent registry into the published inference table
+ * (issue #1527). Uses the registry's own precedence resolution for
+ * every agent (core, marketplace, aliases):
+ *
+ * - model/variant from `effectiveStartupModels` (the actual registered
+ *   default; a model-less session-following agent stays model-less — the
+ *   chain head is never substituted), temperature/options from the finalized
+ *   agent config;
+ * - `fallbackChain` from `modelCandidates`. An EXPLICIT model array of any
+ *   length (including one entry) is preserved — observed Z against a
+ *   configured `[A]` is a legitimate dynamic-head descent. A scalar/no-array
+ *   agent keeps the existing no-chain policy (its synthetic single candidate
+ *   is not a chain);
+ * - `inheritModelFrom` from the runtime override and `fallbackDisabled` from
+ *   the live host-switch bookkeeping normalized to the CANONICAL agent name
+ *   (a display alias cannot resurrect a host-disabled chain);
+ * - display and legacy aliases mirror the full canonical entry, so a child
+ *   resolved by any spelling binds identical inference.
+ */
+export function inferenceProfilesFromRegistry(input: {
+  candidates: InferenceCandidateSource;
+  /** Runtime the registry was resolved against (fresh on refresh). */
+  freshRuntime: RuntimeConfig;
+  /** Live factory runtime: host-switch bookkeeping lives here. */
+  liveRuntime: RuntimeConfig;
+}): AgentRuntimeProfiles {
+  const { candidates, freshRuntime, liveRuntime } = input;
+
+  const canonicalOf = (name: string): string => {
+    for (const [canonical, display] of Object.entries(candidates.identities)) {
+      if (display === name) return canonical;
+    }
+    return AGENT_ALIASES[name] ?? name;
+  };
+
+  const build = (name: string): AgentRuntimeProfile => {
+    const startup = candidates.effectiveStartupModels[name];
+    const entry = candidates.finalAgentConfig[name] as
+      | Record<string, unknown>
+      | undefined;
+    const modelString = startup?.model;
+    const ref =
+      typeof modelString === 'string' ? parseModelRef(modelString) : undefined;
+    const variant =
+      startup?.variant ??
+      (typeof entry?.variant === 'string' ? entry.variant : undefined);
+    const temperature =
+      typeof entry?.temperature === 'number' ? entry.temperature : undefined;
+    const options = entry?.options;
+    const providerOptions =
+      options && typeof options === 'object' && !Array.isArray(options)
+        ? { ...(options as Record<string, unknown>) }
+        : undefined;
+    const rawChain = candidates.modelCandidates[name] ?? [];
+    // Preserve an explicitly configured model array at any length; a scalar
+    // agent (no explicit array) keeps the no-chain policy for its synthetic
+    // single candidate.
+    const explicitArray = freshRuntime.modelArrays[name] !== undefined;
+    const keepChain = explicitArray || rawChain.length > 1;
+    const chain = keepChain
+      ? rawChain.map((item) => ({
+          id: item.id,
+          ...(item.variant ? { variant: item.variant } : {}),
+        }))
+      : [];
+    const inherit = freshRuntime.agent(name)?.inheritModelFrom ?? undefined;
+    const disabled =
+      chain.length > 0 &&
+      freshRuntime.combinedModelInheritanceSource(name) === undefined &&
+      liveRuntime.hasModelSwitched(canonicalOf(name));
+    const sidebarModel =
+      candidates.tuiAgentModels[name] ?? modelString ?? 'default';
+    const sidebarVariant = candidates.tuiAgentVariants[name] ?? variant;
+    return {
+      ...(ref ? { model: { ...ref, ...(variant ? { variant } : {}) } } : {}),
+      ...(temperature !== undefined ? { temperature } : {}),
+      ...(providerOptions ? { providerOptions } : {}),
+      fallbackChain: chain,
+      fallbackDisabled: disabled,
+      ...(inherit !== undefined ? { inheritModelFrom: inherit } : {}),
+      sidebarModel,
+      ...(sidebarVariant !== undefined ? { sidebarVariant } : {}),
+    };
+  };
+
+  const profiles: AgentRuntimeProfiles = {};
+  const names = new Set<string>([
+    ...candidates.agentNames,
+    ...Object.keys(candidates.modelCandidates),
+    ...Object.keys(candidates.effectiveStartupModels),
+  ]);
+  for (const name of names) profiles[name] = build(name);
+
+  // Full-inference alias mirror: display and legacy aliases resolve to the
+  // same canonical entry (model/temperature/options/variant/chain/inherit).
+  for (const [name, display] of Object.entries(candidates.identities)) {
+    const canonical = AGENT_ALIASES[name] ?? name;
+    const source = profiles[canonical];
+    if (!source) continue;
+    for (const alias of [name, display]) {
+      if (alias === canonical) continue;
+      profiles[alias] = { ...source };
+    }
+  }
+  for (const canonical of Object.keys(profiles)) {
+    const legacy = legacyAliasFor(canonical);
+    if (legacy && !profiles[legacy])
+      profiles[legacy] = { ...profiles[canonical] };
+  }
+  return profiles;
 }
 
 function normalizeCustomAgentName(name: string): string {

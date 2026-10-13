@@ -15,6 +15,8 @@ export {
 } from './deepwork-goal';
 export { createDeepworkGuardHook } from './deepwork-guard';
 export {
+  type BoundFallbackResolver,
+  type BoundFallbackSnapshot,
   ForegroundFallbackManager,
   type ForegroundFallbackModel,
 } from './foreground-fallback';

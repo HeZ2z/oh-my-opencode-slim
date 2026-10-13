@@ -34,7 +34,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getPluginConfigCandidates as getConfigCandidates } from '../config/loader';
 import { log } from '../utils/logger';
-import type { V2AgentRuntimeProfiles } from './runtime-profiles';
+import type { V2InferenceTable } from './runtime-profiles';
 
 /** Debounce window for config change bursts (atomic-save style rewrites). */
 export const CONFIG_REFRESH_DEBOUNCE_MS = 300;
@@ -314,14 +314,15 @@ export function watchPluginConfigFiles(
 
 /** Discriminated refresh outcome (matches the v1 `v2.refreshProfiles` hook). */
 export type ProfileRefreshOutcome =
-  | { ok: true; profiles: V2AgentRuntimeProfiles }
+  | { ok: true; table: V2InferenceTable }
   | { ok: false; reason: string };
 
 export interface ProfileRefreshRunnerOptions {
-  /** Re-resolve the profiles (the v1 factory hook). */
+  /** Build the inference table (the v1 factory hook); commits nothing. */
   refresh: () => Promise<ProfileRefreshOutcome>;
-  /** Swap the resolved profiles; only called on success and before abort. */
-  apply: (profiles: V2AgentRuntimeProfiles) => void;
+  /** Publish the built table (swap + sidebar projection); only called on
+   *  success and before abort. */
+  apply: (table: V2InferenceTable) => void;
   /** Test seam: override the logger. */
   log?: (message: string, meta?: unknown) => void;
 }
@@ -347,9 +348,9 @@ export function createProfileRefreshRunner(
       // Disposal raced the refresh: forbid the post-disposal commit.
       return;
     }
-    options.apply(result.profiles);
+    options.apply(result.table);
     emitLog('[v2] runtime profiles refreshed', {
-      agents: Object.keys(result.profiles).length,
+      agents: Object.keys(result.table.profiles).length,
     });
   };
 }

@@ -377,7 +377,7 @@ function getProcessFallbacksInProgress(): Set<string> {
 export type ForegroundFallbackModel = string | { id: string; variant?: string };
 
 /**
- * Frozen fallback binding for one session (issue #1527, batch 1).
+ * Frozen fallback binding for one session (issue #1527).
  * Supplied by the v2 session-profile bridge; v1 never sets it.
  * Discriminated union: `bound-child` always carries the frozen `entries`
  * and `disabled` (never the startup chain); `pending-child`/`startup-policy`
@@ -889,7 +889,7 @@ export class ForegroundFallbackManager {
      *  decision and calls session.switchModel, so it can run on v2 hosts.
      *  Defaults to `enabled` for hosts where both paths apply. */
     private readonly v2RetryEnabled: boolean = enabled,
-    /** Frozen fallback binding reader (issue #1527, batch 1). Wired on v2
+    /** Frozen fallback binding reader (issue #1527). Wired on v2
      *  hosts from the session-profile bridge; unset on v1 (and until the
      *  bridge publishes inference tables), where the startup-chain read is
      *  unchanged. Trailing optional so existing call sites are unaffected. */
@@ -2418,7 +2418,7 @@ export class ForegroundFallbackManager {
   }
 
   /**
-   * Session-aware chain resolution (issue #1527, batch 1). Bound children
+   * Session-aware chain resolution (issue #1527). Bound children
    * descend their captured entries with the same dynamic-head rule as the
    * startup path (an observed model outside the candidates leads; empty
    * chains stay empty) — never the mutable startup chain. Pending children

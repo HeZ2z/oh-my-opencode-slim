@@ -54,6 +54,7 @@ import { OperationTimeoutError, withTimeout } from '../utils/session';
 import {
   adaptTool,
   applyAgentToDraft,
+  parseModelRef,
   snapshotNativeAgentForRegistry,
   v1PermKeyToV2,
 } from './adapters';
@@ -84,8 +85,9 @@ import { createV2InterviewBridge } from './interview-bridge';
 import {
   applyRuntimeProfileOptions,
   createSessionProfileBridge,
-  reconcileRuntimeProfileOptionKeys,
+  type SessionFallbackBinding,
   type V2AgentRuntimeProfiles,
+  type V2InferenceTable,
 } from './runtime-profiles';
 import {
   createSessionSubmit,
@@ -2135,6 +2137,13 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         | undefined;
       let permissionRulesBridgeEnabled = false;
       const pluginAgents = new Set<string>();
+      /** Stable baseline of the ACTUAL host-registered defaults, populated in
+       *  `finalizeAgentDraft` from the resolved agents handed to the host (with
+       *  aliases and model-less defaults). The session-profile bridge holds
+       *  this object by reference and reads it per capture, so a config edit
+       *  between setup registration and finalize is detected against the real
+       *  registered default — never a fresh re-parse. */
+      const registeredProfiles: V2AgentRuntimeProfiles = {};
       let marketplaceAgentsRequirePromptPolicy = false;
       let permissionRulesBridge:
         | ReturnType<typeof createPermissionRulesBridge>
@@ -2194,6 +2203,30 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         >;
         pluginAgents.clear();
         for (const name of Object.keys(resolvedAgents)) pluginAgents.add(name);
+        // Actual registered defaults: the resolved agent projection handed to
+        // the host. Model-less agents stay model-less (session inheritance).
+        for (const [name, cfg] of Object.entries(resolvedAgents)) {
+          const model =
+            typeof cfg.model === 'string'
+              ? parseModelRef(cfg.model)
+              : undefined;
+          const variant =
+            typeof cfg.variant === 'string' ? cfg.variant : undefined;
+          const entry = {
+            ...(model
+              ? { model: { ...model, ...(variant ? { variant } : {}) } }
+              : {}),
+            sidebarModel: registry.tuiAgentModels[name] ?? 'default',
+            ...(registry.tuiAgentVariants[name]
+              ? { sidebarVariant: registry.tuiAgentVariants[name] }
+              : {}),
+          };
+          registeredProfiles[name] = entry;
+          const identity = registry.identities[name];
+          if (identity && identity !== name) {
+            registeredProfiles[identity] = entry;
+          }
+        }
         if (permissionRulesBridge) {
           permissionRulesBridge.refreshPluginAgents();
         }
@@ -2358,42 +2391,41 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       // ── Runtime profiles + config-file watcher ──
       // Watches every config candidate (user + project, .json + .jsonc,
       // including not-yet-created files/directories). On a settled change the
-      // v1 factory's `v2.refreshProfiles` hook re-reads the config and
-      // resolves ONLY model/variant/temperature/options per agent, atomically
-      // swapped here and projected to the sidebar through the existing
-      // tui-state writer. Failure is honest: no swap, one logged cause.
-      let currentProfiles: V2AgentRuntimeProfiles = {};
-      let registeredProfiles: V2AgentRuntimeProfiles = {};
+      // v1 factory's `v2.refreshProfiles` hook BUILDS a complete inference
+      // table via the same pure registry precedence (no commit) and the
+      // runner PUBLISHES it via `v2.publishInference` after its abort check —
+      // one shared table reference, sidebar projected after the swap. The
+      // builder refuses until the registry is finalized, so no normal edit can
+      // publish a core-only table. Failure is honest: no swap, one logged
+      // cause.
+      let readPublished: () => V2AgentRuntimeProfiles = () => ({});
       try {
-        const factoryRefreshProfiles = (
-          v1Hooks as { 'v2.refreshProfiles'?: unknown }
-        )['v2.refreshProfiles'];
-        if (typeof factoryRefreshProfiles === 'function') {
-          const refreshProfiles = factoryRefreshProfiles as (options?: {
+        const extra = v1Hooks as unknown as {
+          'v2.refreshProfiles'?: (options?: {
             allowInvalidFallback?: boolean;
           }) => Promise<
-            | { ok: true; profiles: V2AgentRuntimeProfiles }
+            | { ok: true; table: V2InferenceTable }
             | { ok: false; reason: string }
           >;
-          // Startup has no last-good table. Seed from the loader's normal
-          // fallback config so malformed input stays non-fatal, then make all
-          // later watcher refreshes strict and retain this seed on failure.
-          const initial = await refreshProfiles({ allowInvalidFallback: true });
-          if (!initial.ok) {
-            throw new Error(initial.reason);
-          }
-          registeredProfiles = initial.profiles;
-          currentProfiles = reconcileRuntimeProfileOptionKeys(
-            {},
-            initial.profiles,
-          );
+          'v2.publishInference'?: (table: V2InferenceTable) => {
+            profiles: V2AgentRuntimeProfiles;
+            sidebarOk: boolean;
+          };
+          'v2.readPublishedInference'?: () =>
+            | V2AgentRuntimeProfiles
+            | undefined;
+        };
+        const factoryRefreshProfiles = extra['v2.refreshProfiles'];
+        const factoryPublish = extra['v2.publishInference'];
+        if (
+          typeof factoryRefreshProfiles === 'function' &&
+          typeof factoryPublish === 'function'
+        ) {
+          readPublished = () => extra['v2.readPublishedInference']?.() ?? {};
           const runner = createProfileRefreshRunner({
-            refresh: refreshProfiles,
-            apply: (profiles) => {
-              currentProfiles = reconcileRuntimeProfileOptionKeys(
-                currentProfiles,
-                profiles,
-              );
+            refresh: factoryRefreshProfiles,
+            apply: (table) => {
+              factoryPublish(table);
             },
           });
           const watch = watchPluginConfigFiles({
@@ -2622,12 +2654,30 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       // prewarm/cleanup consumer of `session.created`/`session.deleted`.
       let promptBridge: V2SessionPromptBridge | undefined;
       const sessionProfileBridge = createSessionProfileBridge({
-        profiles: () => currentProfiles,
+        // The bridge reads the SINGLE published table (issue #1527): empty
+        // until finalize publishes the complete roster, so a core-only seed
+        // is never captured.
+        profiles: () => readPublished(),
         registeredProfiles,
         pluginAgents,
         session: ctx.session,
         knownAgent: (sessionID) => promptBridge?.agentForSession(sessionID),
       });
+      // Wire the frozen-binding reader into the fallback manager here; clear
+      // it on disposal so the manager never holds a dangling bridge reference.
+      const setFallbackResolver = (
+        v1Hooks as unknown as {
+          'v2.setFallbackResolver'?: (
+            resolver:
+              | ((sessionID: string) => SessionFallbackBinding | undefined)
+              | undefined,
+          ) => void;
+        }
+      )['v2.setFallbackResolver'];
+      setFallbackResolver?.((sessionID) =>
+        sessionProfileBridge.fallbackBindingForSession(sessionID),
+      );
+      disposers.push(() => setFallbackResolver?.(undefined));
 
       // Skip session hook registration if ctx.session is unavailable (v1 host
       // embedded v2 core with limited context). On full v2 contexts, session

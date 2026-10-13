@@ -548,8 +548,8 @@ export function recordTuiAgentModels(
     agentVariants?: Record<string, string>;
   },
   projectDir: string,
-): void {
-  updateSnapshot(projectDir, (snapshot) => {
+): boolean {
+  return updateSnapshot(projectDir, (snapshot) => {
     snapshot.agentModels = { ...input.agentModels };
     snapshot.agentVariants = { ...(input.agentVariants ?? {}) };
   });
