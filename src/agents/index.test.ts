@@ -151,7 +151,7 @@ describe('inferenceProfilesFromRegistry (issue #1527)', () => {
     return { ...base, ...overrides };
   }
 
-  test('mirrors FULL inference (model/temp/options/variant/chain/inherit) to display and legacy aliases', () => {
+  test('mirrors the canonical entry onto an alias the registry did not resolve independently', () => {
     const runtime = runtimeFor({
       agents: { explorer: { inheritModelFrom: 'session' } },
     });
@@ -173,8 +173,8 @@ describe('inferenceProfilesFromRegistry (issue #1527)', () => {
     expect(canonical?.providerOptions).toEqual({ thinking: true });
     expect(canonical?.sidebarModel).toBe('pa/A');
 
-    // Display alias and the legacy AGENT_ALIASES spelling ('explore') carry
-    // the SAME resolved inference, not just the chain/inherit subset.
+    // No independent display entry and no legacy entry: both mirror the
+    // canonical inference.
     for (const alias of ['advisor', 'explore']) {
       expect(profiles[alias]?.model).toEqual(canonical?.model);
       expect(profiles[alias]?.fallbackChain).toEqual(canonical?.fallbackChain);
@@ -183,6 +183,76 @@ describe('inferenceProfilesFromRegistry (issue #1527)', () => {
       expect(profiles[alias]?.providerOptions).toEqual({ thinking: true });
       expect(profiles[alias]?.sidebarModel).toBe('pa/A');
     }
+  });
+
+  test('preserves an independently resolved display alias and shares only metadata', () => {
+    const runtime = runtimeFor({
+      agents: { explorer: { model: ['pa/A', 'pb/B'] } },
+    });
+
+    const profiles = inferenceProfilesFromRegistry({
+      candidates: source({
+        identities: { explorer: 'advisor' },
+        effectiveStartupModels: {
+          explorer: { model: 'pa/A' },
+          advisor: { model: 'va/V', variant: 'vis' },
+        },
+        tuiAgentModels: { explorer: 'pa/A', advisor: 'va/V' },
+        tuiAgentVariants: { advisor: 'vis' },
+        finalAgentConfig: {
+          explorer: { temperature: 0.1, options: { canonical: true } },
+          advisor: { temperature: 0.9, options: { visible: true } },
+        },
+      }),
+      freshRuntime: runtime,
+      liveRuntime: runtime,
+    });
+
+    // The alias keeps its OWN resolved model/variant/temperature/options/sidebar.
+    expect(profiles.advisor?.model).toEqual({
+      providerID: 'va',
+      id: 'V',
+      variant: 'vis',
+    });
+    expect(profiles.advisor?.temperature).toBe(0.9);
+    expect(profiles.advisor?.providerOptions).toEqual({ visible: true });
+    expect(profiles.advisor?.sidebarModel).toBe('va/V');
+    expect(profiles.advisor?.sidebarVariant).toBe('vis');
+    // Only the shared fallback metadata comes from the canonical entry.
+    expect(profiles.advisor?.fallbackChain).toEqual(
+      profiles.explorer?.fallbackChain,
+    );
+    expect(profiles.advisor?.fallbackDisabled).toBe(
+      profiles.explorer?.fallbackDisabled,
+    );
+  });
+
+  test('clears a stale alias inheritance when the canonical entry has none', () => {
+    const runtime = runtimeFor({
+      agents: {
+        explorer: { model: ['pa/A', 'pb/B'] },
+        advisor: { inheritModelFrom: 'session' },
+      },
+    });
+
+    const profiles = inferenceProfilesFromRegistry({
+      candidates: source({
+        identities: { explorer: 'advisor' },
+        effectiveStartupModels: {
+          explorer: { model: 'pa/A' },
+          advisor: { model: 'va/V' },
+        },
+        tuiAgentModels: { explorer: 'pa/A', advisor: 'va/V' },
+      }),
+      freshRuntime: runtime,
+      liveRuntime: runtime,
+    });
+
+    // The alias resolved its own inheritance, but the canonical entry has
+    // none: metadata sharing must CLEAR it, not retain it.
+    expect(profiles.explorer?.inheritModelFrom).toBeUndefined();
+    expect(profiles.advisor?.inheritModelFrom).toBeUndefined();
+    expect(profiles.advisor?.model).toEqual({ providerID: 'va', id: 'V' });
   });
 
   test('a model-less registered default stays model-less (chain head not substituted)', () => {

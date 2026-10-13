@@ -7,8 +7,9 @@ import {
   adaptPermissions,
   snapshotNativeAgentForRegistry,
 } from '../v2/adapters';
+import { createSessionProfileBridge } from '../v2/runtime-profiles';
 import type { V2PermissionRule } from '../v2/types';
-import { createAgents } from './index';
+import { createAgents, inferenceProfilesFromRegistry } from './index';
 import { buildResolvedAgentRegistry } from './registry';
 
 const DIR = 'runtime-test-final-agent-registry';
@@ -597,6 +598,105 @@ describe('finalized existing-agent registry', () => {
     expect(registry.nativePolicies.Scout.decide('skill', 'review-tools')).toBe(
       'deny',
     );
+  });
+
+  test('inference profiles keep a display alias’s own resolved override (no canonical clobber)', async () => {
+    const runtime = runtimeFor({
+      agents: {
+        explorer: { displayName: 'Scout', model: ['plugin/A', 'plugin/B'] },
+      },
+    });
+    const registry = build(runtime, {
+      agent: {
+        explorer: {
+          model: 'canonical/C',
+          variant: 'canonical-v',
+          temperature: 0.1,
+          options: { canonical: true },
+        },
+        Scout: {
+          model: 'visible/V',
+          variant: 'visible-v',
+          temperature: 0.9,
+          options: { visible: true },
+        },
+      },
+    });
+    // Simulate the finalize host-model-switch bookkeeping (host override
+    // differs from the configured chain head): the chain must stay disabled.
+    runtime.everModelSwitched('explorer');
+
+    expect(registry.effectiveStartupModels.explorer).toEqual({
+      model: 'canonical/C',
+      variant: 'canonical-v',
+    });
+    expect(registry.effectiveStartupModels.Scout).toEqual({
+      model: 'visible/V',
+      variant: 'visible-v',
+    });
+
+    const profiles = inferenceProfilesFromRegistry({
+      candidates: registry,
+      freshRuntime: runtime,
+      liveRuntime: runtime,
+    });
+
+    // Canonical keeps its own override; the display alias keeps ITS own
+    // resolved model/variant/temperature/options/sidebar.
+    expect(profiles.explorer?.model).toEqual({
+      providerID: 'canonical',
+      id: 'C',
+      variant: 'canonical-v',
+    });
+    expect(profiles.Scout?.model).toEqual({
+      providerID: 'visible',
+      id: 'V',
+      variant: 'visible-v',
+    });
+    expect(profiles.Scout?.temperature).toBe(0.9);
+    expect(profiles.Scout?.providerOptions).toEqual({ visible: true });
+    expect(profiles.Scout?.sidebarModel).toBe('visible/V');
+    expect(profiles.Scout?.sidebarVariant).toBe('visible-v');
+
+    // Shared metadata only: the chain/disabled policy is identical for both.
+    expect(profiles.Scout?.fallbackChain).toEqual(
+      profiles.explorer?.fallbackChain,
+    );
+    expect(profiles.explorer?.fallbackDisabled).toBe(true);
+    expect(profiles.Scout?.fallbackDisabled).toBe(true);
+
+    const switches: unknown[] = [];
+    const bridge = createSessionProfileBridge({
+      profiles: () => profiles,
+      registeredProfiles: {
+        Scout: {
+          model: { providerID: 'visible', id: 'V', variant: 'visible-v' },
+          sidebarModel: 'visible/V',
+        },
+      },
+      pluginAgents: new Set(['explorer', 'Scout']),
+      session: {
+        get: async () => ({
+          parentID: 'parent',
+          agent: 'Scout',
+          model: { providerID: 'visible', id: 'V', variant: 'visible-v' },
+        }),
+        switchModel: async (input: unknown) => {
+          switches.push(input);
+        },
+      } as never,
+    });
+    await bridge.ensureSessionProfile('scout-child');
+    expect(switches).toEqual([
+      {
+        sessionID: 'scout-child',
+        model: { providerID: 'visible', id: 'V', variant: 'visible-v' },
+      },
+    ]);
+    expect(bridge.profileForSession('scout-child')?.temperature).toBe(0.9);
+    expect(bridge.profileForSession('scout-child')?.providerOptions).toEqual({
+      visible: true,
+    });
   });
 
   test('visible native rules backfill the canonical policy when no canonical rules exist', () => {

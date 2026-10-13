@@ -621,8 +621,11 @@ export interface InferenceCandidateSource {
  * - `inheritModelFrom` from the runtime override and `fallbackDisabled` from
  *   the live host-switch bookkeeping normalized to the CANONICAL agent name
  *   (a display alias cannot resurrect a host-disabled chain);
- * - display and legacy aliases mirror the full canonical entry, so a child
- *   resolved by any spelling binds identical inference.
+ * - a display alias the registry resolved independently (its own host-override
+ *   model/variant/temperature/options/sidebar) keeps those fields; only the
+ *   chain/inheritance/disabled metadata is shared from the canonical entry. An
+ *   alias without an independent entry mirrors the canonical entry, and legacy
+ *   `AGENT_ALIASES` spellings are filled only when missing.
  */
 export function inferenceProfilesFromRegistry(input: {
   candidates: InferenceCandidateSource;
@@ -698,15 +701,31 @@ export function inferenceProfilesFromRegistry(input: {
   ]);
   for (const name of names) profiles[name] = build(name);
 
-  // Full-inference alias mirror: display and legacy aliases resolve to the
-  // same canonical entry (model/temperature/options/variant/chain/inherit).
+  // Alias handling: the registry resolves a separate display entry when it
+  // registers one (its own host-override model/variant/temperature/options/
+  // sidebar). Never clobber that with the canonical entry — share only the
+  // intended chain/inheritance/disabled metadata. When the alias has no
+  // independently resolved entry, mirror the canonical entry (the registry
+  // did not register it), and legacy AGENT_ALIASES spellings only when missing.
   for (const [name, display] of Object.entries(candidates.identities)) {
     const canonical = AGENT_ALIASES[name] ?? name;
     const source = profiles[canonical];
     if (!source) continue;
-    for (const alias of [name, display]) {
-      if (alias === canonical) continue;
-      profiles[alias] = { ...source };
+    const target = profiles[display];
+    if (!target) {
+      if (display !== canonical) profiles[display] = { ...source };
+      continue;
+    }
+    if (target === source) continue;
+    // Preserve target's own resolved model/variant/temperature/options/
+    // sidebar; align only the shared fallback metadata. Canonical-empty
+    // inheritance must CLEAR a stale alias value (not retain it).
+    target.fallbackChain = source.fallbackChain;
+    target.fallbackDisabled = source.fallbackDisabled;
+    if (source.inheritModelFrom !== undefined) {
+      target.inheritModelFrom = source.inheritModelFrom;
+    } else {
+      delete target.inheritModelFrom;
     }
   }
   for (const canonical of Object.keys(profiles)) {
