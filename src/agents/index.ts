@@ -7,12 +7,10 @@ import {
   DEFAULT_MODELS,
   loadAgentPrompt,
   type PluginConfig,
-  type Preset,
   SUBAGENT_NAMES,
 } from '../config';
 import { getAgentMcpList } from '../config/agent-mcps';
-import type { HostAgentConfig, RuntimeConfig } from '../config/runtime';
-import { applyOrchestratorModelConfig } from '../config/strip-orchestrator-model';
+import type { RuntimeConfig } from '../config/runtime';
 import { legacyAliasFor } from '../config/utils';
 import { escapeRegExp, normalizeAgentName } from '../utils/agent-variant';
 import { delegationVocabulary, parseModelRef } from '../v2/adapters';
@@ -308,31 +306,23 @@ function isKnownAgentName(name: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime state projection
+// Runtime inference profiles
 //
-// The config hook and the v2 hot-profile refresh both need the exact same
-// final model resolution: host-layer merge, array-primary pass, runtime
-// preset pass, model inheritance, sidebar projection, and orchestrator-model
-// stripping. These helpers are the single source of truth for that pipeline;
-// the config hook owns only the host-container side effects (model-switch
-// tracking, container assignment).
+// The v2 hot-profile refresh resolves each agent's inference through the
+// managed registry (`buildResolvedAgentRegistry`) and formats it with
+// `inferenceProfilesFromRegistry`; the config hook owns only the host-container
+// side effects (model-switch tracking, container assignment).
 // ---------------------------------------------------------------------------
-
-/** Sidebar model/variant projection for one agent set. */
-export interface AgentModelProjection {
-  agentModels: Record<string, string>;
-  agentVariants: Record<string, string>;
-}
 
 /**
  * Inference/runtime fields of one agent that may hot-apply to NEW child
  * sessions plus the sidebar. Everything else (prompt, tools, permissions,
  * skills, MCPs, description) stays frozen for a session's lifetime.
  *
- * `fallbackChain`/`fallbackDisabled` are populated by
- * `attachInferenceCandidates` for every finalized-roster entry (issue
- * #1527): an explicit (possibly empty) chain is the bound descent for newly
- * captured children and never the startup chain.
+ * `fallbackChain`/`fallbackDisabled` are populated for every finalized-roster
+ * entry by `inferenceProfilesFromRegistry` (issue #1527): an explicit
+ * (possibly empty) chain is the bound descent for newly captured children and
+ * never the startup chain.
  */
 export interface AgentRuntimeProfile {
   model?: { providerID: string; id: string; variant?: string };
@@ -351,237 +341,6 @@ export interface AgentRuntimeProfile {
 }
 
 export type AgentRuntimeProfiles = Record<string, AgentRuntimeProfile>;
-
-/**
- * Merge the host opencode `agent` layer over the plugin's agent configs with
- * the plugin's shallow-merge precedence (host fields win per agent). The
- * optional `onUserModelSwitch` observes host-persisted models only — the
- * config hook uses it for the fallback-chain disable bookkeeping; the
- * read-only profile refresh passes none.
- */
-export function mergeHostAgentConfigs(
-  agents: Record<string, Record<string, unknown>>,
-  hostAgents: Record<string, HostAgentConfig> | undefined,
-  onUserModelSwitch?: (agentName: string, hostModel: string) => void,
-): Record<string, Record<string, unknown>> {
-  const merged: Record<string, Record<string, unknown>> = {};
-  for (const [name, pluginAgent] of Object.entries(agents)) {
-    const existing = hostAgents?.[name];
-    if (existing && typeof existing.model === 'string') {
-      onUserModelSwitch?.(name, existing.model);
-    }
-    merged[name] = existing
-      ? { ...pluginAgent, ...existing }
-      : { ...pluginAgent };
-  }
-
-  // Display names are host-facing keys. Mirror their inference overrides to
-  // the canonical entry used by runtime-profile lookup unless the host also
-  // supplied a canonical override. Other host config stays independent.
-  for (const [name, pluginAgent] of Object.entries(agents)) {
-    const displayName = pluginAgent.displayName;
-    if (typeof displayName !== 'string') continue;
-    const visibleName = normalizeAgentName(displayName);
-    const displayOverride = hostAgents?.[visibleName];
-    const displayConfig = merged[visibleName];
-    const canonicalOverride = hostAgents?.[name];
-    const canonical = merged[name];
-    if (!displayOverride || !displayConfig || !canonical) continue;
-    // A canonical host entry is authoritative as a whole; falling back to
-    // display-name fields individually can mix incompatible model settings.
-    if (canonicalOverride !== undefined) continue;
-    for (const key of ['model', 'variant', 'temperature', 'options'] as const) {
-      if (displayConfig[key] !== undefined) canonical[key] = displayConfig[key];
-    }
-    if (typeof displayOverride.model === 'string') {
-      onUserModelSwitch?.(name, displayOverride.model);
-    }
-  }
-  return merged;
-}
-
-/** Model value for one entry (string model only; arrays resolved upstream). */
-function entryModelString(
-  entry: Record<string, unknown> | undefined,
-): string | undefined {
-  return typeof entry?.model === 'string' ? entry.model : undefined;
-}
-
-/**
- * Project the runtime state for a set of resolved agent definitions:
- *
- * 1. array-primary pass (`runtime.modelArrays` → first model unless the
- *    entry already pinned one);
- * 2. runtime-preset override pass (in-session preset switch wins);
- * 3. model-inheritance policy (`inheritModelFrom`);
- * 4. sidebar projection (`recordTuiAgentModels` payload);
- * 5. per-agent runtime profiles for model/variant/temperature/options.
- *
- * `agentConfigs` is mutated in place (entries only, matching the config
- * hook's historical behavior) and orchestrator-model stripping is applied
- * AFTER the projection so the sidebar/profile keep the configured model.
- */
-export function projectAgentRuntimeState(input: {
-  runtime: RuntimeConfig;
-  agentDefs: readonly AgentDefinition[];
-  agentConfigs: Record<string, Record<string, unknown>>;
-  /** Resolved runtime-preset agent map (in-session switch), when active. */
-  runtimePreset?: Preset;
-}): { profiles: AgentRuntimeProfiles; projection: AgentModelProjection } {
-  const { runtime, agentDefs, agentConfigs, runtimePreset } = input;
-
-  // 1. Array-primary pass.
-  if (Object.keys(runtime.modelArrays).length > 0) {
-    for (const [agentName, models] of Object.entries(runtime.modelArrays)) {
-      if (models.length === 0) continue;
-      const chosen = models[0];
-      const entry = agentConfigs[agentName];
-      if (entry) {
-        // A user-selected model (host layer) takes precedence over the
-        // config's fallback chain.
-        if (entry.model === undefined) {
-          entry.model = chosen.id;
-          if (chosen.variant) {
-            entry.variant = chosen.variant;
-          }
-        }
-      } else {
-        agentConfigs[agentName] = {
-          model: chosen.id,
-          ...(chosen.variant ? { variant: chosen.variant } : {}),
-        };
-      }
-    }
-  }
-
-  // 2. Runtime-preset override pass.
-  if (runtimePreset) {
-    for (const [agentName, override] of Object.entries(runtimePreset)) {
-      const resolvedName = AGENT_ALIASES[agentName] ?? agentName;
-      const entry = agentConfigs[resolvedName];
-      if (!entry) continue;
-
-      if (typeof override.model === 'string') {
-        entry.model = override.model;
-      } else if (Array.isArray(override.model) && override.model.length > 0) {
-        const first = override.model[0];
-        entry.model = typeof first === 'string' ? first : first.id;
-        if (typeof first !== 'string' && first.variant) {
-          entry.variant = first.variant;
-        }
-      }
-      // Explicitly set or clear scalar fields so switching from Preset A
-      // (which sets a field) to Preset B (which doesn't) leaves no stale
-      // values behind.
-      if (typeof override.variant === 'string') {
-        entry.variant = override.variant;
-      } else if ('variant' in override) {
-        delete entry.variant;
-      }
-      if (typeof override.temperature === 'number') {
-        entry.temperature = override.temperature;
-      } else if ('temperature' in override) {
-        delete entry.temperature;
-      }
-      if (
-        override.options &&
-        typeof override.options === 'object' &&
-        !Array.isArray(override.options)
-      ) {
-        entry.options = override.options;
-      } else if ('options' in override) {
-        delete entry.options;
-      }
-    }
-  }
-
-  // 3. Model-inheritance policy (authoritative for inheritModelFrom agents).
-  applyModelInheritanceToConfig(agentConfigs, runtime);
-
-  // 4. Sidebar projection (pre-strip; mirrors the historical capture).
-  const projection: AgentModelProjection = {
-    agentModels: {},
-    agentVariants: {},
-  };
-  for (const agentDef of agentDefs) {
-    if (
-      agentDef.name === 'council' ||
-      agentDef.name === 'councillor' ||
-      agentDef.name.startsWith('councillor-')
-    ) {
-      continue;
-    }
-    const entry = agentConfigs[agentDef.name];
-    // Session-following combined agents have no launch model of their own:
-    // entry.model is cleared, the chain head is only a fallback tail, and
-    // agentDef.config.model is deleted by inheritance. Skip the chain-head
-    // probe so they display 'default'.
-    const followsSessionModel =
-      runtime.combinedModelInheritanceSource(agentDef.name) === 'session';
-    const resolvedModel =
-      entryModelString(entry) ??
-      (followsSessionModel
-        ? undefined
-        : runtime.runtimeChains[agentDef.name]?.[0]
-          ? runtime.runtimeChains[agentDef.name][0]
-          : typeof agentDef.config.model === 'string'
-            ? agentDef.config.model
-            : undefined);
-    const resolvedVariant =
-      typeof entry?.variant === 'string'
-        ? entry.variant
-        : typeof agentDef.config.variant === 'string'
-          ? agentDef.config.variant
-          : undefined;
-
-    projection.agentModels[agentDef.name] = resolvedModel ?? 'default';
-    if (resolvedVariant) {
-      projection.agentVariants[agentDef.name] = resolvedVariant;
-    }
-  }
-
-  // 5. Runtime profiles for NEW child dispatches. Keyed by every resolved
-  // config entry (includes display-name aliases) so a child whose session
-  // agent is either spelling resolves the same profile.
-  const profiles: AgentRuntimeProfiles = {};
-  for (const [name, entry] of Object.entries(agentConfigs)) {
-    const modelString = entryModelString(entry);
-    const ref = parseModelRef(modelString);
-    const variant =
-      typeof entry.variant === 'string' ? entry.variant : undefined;
-    const temperature =
-      typeof entry.temperature === 'number' ? entry.temperature : undefined;
-    const providerOptions =
-      entry.options &&
-      typeof entry.options === 'object' &&
-      !Array.isArray(entry.options)
-        ? {
-            ...(entry.options as Record<string, unknown>),
-          }
-        : undefined;
-    const sidebarModel = projection.agentModels[name];
-    const sidebarVariant = projection.agentVariants[name] ?? variant;
-    profiles[name] = {
-      ...(ref ? { model: { ...ref, ...(variant ? { variant } : {}) } } : {}),
-      ...(temperature !== undefined ? { temperature } : {}),
-      ...(providerOptions ? { providerOptions } : {}),
-      sidebarModel: sidebarModel ?? modelString ?? 'default',
-      ...(sidebarVariant !== undefined ? { sidebarVariant } : {}),
-    };
-  }
-
-  // 6. Orchestrator-model stripping runs AFTER the projection capture, exactly
-  // as the config hook has always ordered it.
-  applyOrchestratorModelConfig({
-    agents: agentConfigs,
-    enabled: runtime.stripOrchestratorModel,
-    presets: runtime.plugin?.presets,
-    configPreset: runtime.plugin?.preset,
-    runtimePreset: runtime.getRuntimePreset(),
-  });
-
-  return { profiles, projection };
-}
 
 /**
  * Minimal candidate/roster surface of a resolved agent registry (issue

@@ -17,6 +17,7 @@
  * Existing/resumed child sessions keep the profile captured when they were
  * first seen; parents and foreign-agent sessions are never touched.
  */
+import type { BoundFallbackSnapshot } from '../hooks/foreground-fallback';
 import type { V2Context, V2SessionContextEvent } from './types';
 
 /** One agent's hot-applicable inference fields + sidebar projection. */
@@ -30,11 +31,11 @@ export interface V2AgentRuntimeProfile {
   managedProviderOptionKeys?: readonly string[];
   /**
    * Ordered fallback candidates frozen with the profile (issue #1527).
-   * Final wiring populates this for every bound profile; a captured entry
-   * without it reads as `startup-policy` (never a chain-less `bound-child`
-   * that would silently keep the startup read). An explicit (possibly
-   * empty) array is the bound chain for captured children — empty or
-   * `fallbackDisabled` never falls back to the startup chain.
+   * `inferenceProfilesFromRegistry` populates this for every published entry;
+   * a captured entry without it retains the startup-policy compatibility
+   * path. An explicit (possibly empty) array is the bound
+   * chain for captured children — empty or `fallbackDisabled` never falls back
+   * to the startup chain.
    */
   fallbackChain?: ReadonlyArray<{ id: string; variant?: string }>;
   /** Explicitly disabled fallback chain: bound children are not steered. */
@@ -176,42 +177,23 @@ export interface SessionProfileBridge {
   /** Frozen profile for a session (undefined when not captured). */
   profileForSession(sessionID: string): V2AgentRuntimeProfile | undefined;
   /**
-   * Three-state fallback binding for a session (issue #1527):
-   * - `bound-child`: captured entry with frozen `entries`/`disabled`;
-   *   an explicit (possibly empty) array is the bound chain, never the
-   *   startup chain. A captured legacy profile without candidate data
-   *   reads as `startup-policy` until wiring populates every profile.
+   * Three-state fallback binding for a session (issue #1527). Returns the
+   * shared `BoundFallbackSnapshot` union (defined by the foreground-fallback
+   * hook):
+   * - `bound-child`: captured entry with frozen `entries`/`disabled`; an
+   *   explicit (possibly empty) array is the bound chain, never the startup
+   *   chain.
    * - `pending-child`: confirmed managed child without a successful capture
    *   (in-flight or failed switch); do not steer, retain the host decision.
-   * - `startup-policy`: root/foreign/never-seen (or legacy snapshot without
-   *   candidate data); keep the original startup policy and isolation rules.
+   * - `startup-policy`: root/foreign/never-seen; keep the original startup
+   *   policy and isolation rules.
    */
   fallbackBindingForSession(
     sessionID: string,
-  ): SessionFallbackBinding | undefined;
+  ): BoundFallbackSnapshot | undefined;
   /** Captured session count (released via session.deleted; test seam). */
   size(): number;
 }
-
-/**
- * Fallback binding for one session (issue #1527). Discriminated
- * union: `bound-child` always carries the frozen `entries` and `disabled`;
- * `pending-child`/`startup-policy` carry no bound fields. A captured legacy
- * profile without candidate data reads as `startup-policy` until wiring
- * populates every bound profile (final wiring must populate all entries).
- */
-export type SessionFallbackBinding =
-  | {
-      state: 'bound-child';
-      /** Agent the bound entry was captured for. */
-      agent?: string;
-      /** Frozen fallback candidates (possibly empty, never the startup chain). */
-      entries: ReadonlyArray<{ id: string; variant?: string }>;
-      /** Frozen disabled-chain flag. */
-      disabled: boolean;
-    }
-  | { state: 'pending-child' }
-  | { state: 'startup-policy' };
 
 /**
  * Freeze the current runtime profile for each newly seen plugin child session
@@ -514,8 +496,8 @@ export function createSessionProfileBridge(
             disabled: false,
           };
         }
-        // A captured legacy profile without candidate data reads as
-        // startup-policy until wiring populates every bound profile.
+        // Profiles without candidate metadata retain the startup-policy
+        // compatibility path; published registry entries always carry it.
         if (entry.profile.fallbackChain === undefined) {
           return { state: 'startup-policy' };
         }

@@ -18,8 +18,6 @@ import {
   type InferenceCandidateSource,
   inferenceProfilesFromRegistry,
   isSubagent,
-  mergeHostAgentConfigs,
-  projectAgentRuntimeState,
 } from './index';
 import { TASK_REJECTION_INSTRUCTION } from './task-rejection';
 
@@ -36,99 +34,6 @@ function councilConfig() {
   });
   return parsed;
 }
-
-describe('hot-refreshed runtime profiles', () => {
-  test('applies display-name host model overrides to canonical agent profiles', () => {
-    const runtime = runtimeFor({
-      agents: {
-        explorer: { displayName: 'Scout', model: 'plugin/default' },
-      },
-    });
-    const agentDefs = createAgents(runtime);
-    const agentConfigs = getAgentConfigsFromDefinitions(runtime, agentDefs);
-    const merged = mergeHostAgentConfigs(
-      agentConfigs as Record<string, Record<string, unknown>>,
-      {
-        Scout: {
-          model: 'host/scout',
-          variant: 'host-variant',
-          temperature: 0.4,
-          options: { thinking: { type: 'enabled' } },
-        },
-      },
-    );
-
-    const { profiles, projection } = projectAgentRuntimeState({
-      runtime,
-      agentDefs,
-      agentConfigs: merged,
-    });
-
-    expect(profiles.explorer).toMatchObject({
-      model: { providerID: 'host', id: 'scout', variant: 'host-variant' },
-      sidebarModel: 'host/scout',
-      sidebarVariant: 'host-variant',
-      temperature: 0.4,
-      providerOptions: { thinking: { type: 'enabled' } },
-    });
-    expect(profiles.Scout).toMatchObject({
-      model: { providerID: 'host', id: 'scout', variant: 'host-variant' },
-      sidebarModel: 'host/scout',
-    });
-    expect(projection.agentModels.explorer).toBe('host/scout');
-  });
-
-  test('canonical host entry atomically wins over the display alias', () => {
-    const runtime = runtimeFor({
-      agents: { explorer: { displayName: 'Scout', model: 'plugin/default' } },
-    });
-    const agentDefs = createAgents(runtime);
-    const merged = mergeHostAgentConfigs(
-      getAgentConfigsFromDefinitions(runtime, agentDefs) as Record<
-        string,
-        Record<string, unknown>
-      >,
-      {
-        explorer: {
-          model: 'host/canonical',
-          variant: 'canonical-variant',
-          temperature: 0.2,
-          options: { canonical: true },
-        },
-        Scout: {
-          model: 'host/scout',
-          variant: 'visible-variant',
-          temperature: 0.8,
-          options: { visible: true },
-        },
-      },
-    );
-
-    const { profiles } = projectAgentRuntimeState({
-      runtime,
-      agentDefs,
-      agentConfigs: merged,
-    });
-
-    expect(profiles.explorer).toMatchObject({
-      sidebarModel: 'host/canonical',
-      sidebarVariant: 'canonical-variant',
-      temperature: 0.2,
-      providerOptions: { canonical: true },
-    });
-    expect(profiles.explorer?.model).toEqual({
-      providerID: 'host',
-      id: 'canonical',
-      variant: 'canonical-variant',
-    });
-    expect(profiles.Scout).toMatchObject({
-      sidebarModel: 'host/scout',
-      sidebarVariant: 'visible-variant',
-      temperature: 0.8,
-      providerOptions: { visible: true },
-    });
-  });
-});
 
 describe('inferenceProfilesFromRegistry (issue #1527)', () => {
   /** Minimal candidate source with a name → display identity pair. */

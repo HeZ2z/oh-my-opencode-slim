@@ -946,8 +946,8 @@ export class ForegroundFallbackManager {
   }
 
   /**
-   * Install (or clear) the frozen fallback binding reader. Batch-1 seam:
-   * v2 setup will wire the session-profile bridge here; v1 never sets it.
+   * Install (or clear) the frozen fallback binding reader. v2 setup wires the
+   * session-profile bridge here and clears it on disposal; v1 never sets it.
    */
   setBoundFallbackResolver(resolver: BoundFallbackResolver | undefined): void {
     this.boundFallbackResolver = resolver;

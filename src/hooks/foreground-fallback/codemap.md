@@ -58,7 +58,7 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
   3. Merged list (last resort) → preserve insertion order across all agents
 - **No cross-agent bleed**: When agent is identified, only that agent's chain is used (prevents re-prompting with wrong agent's models)
 - **Frozen session binding (v2)**: On v2 hosts `src/v2/setup.ts` installs a
-  three-state reader (`v2.setFallbackResolver` → `SessionFallbackBinding`,
+  three-state reader (`v2.setFallbackResolver` → `BoundFallbackSnapshot`,
   cleared on disposal). A `bound-child` resolves to the candidates captured with
   that child's inference entry (empty/disabled stays empty — never the startup
   chain, and its variant is used for the switch request); a `pending-child`

@@ -648,6 +648,10 @@ describe('finalized existing-agent registry', () => {
       id: 'C',
       variant: 'canonical-v',
     });
+    expect(profiles.explorer?.temperature).toBe(0.1);
+    expect(profiles.explorer?.providerOptions).toEqual({ canonical: true });
+    expect(profiles.explorer?.sidebarModel).toBe('canonical/C');
+    expect(profiles.explorer?.sidebarVariant).toBe('canonical-v');
     expect(profiles.Scout?.model).toEqual({
       providerID: 'visible',
       id: 'V',
@@ -697,6 +701,48 @@ describe('finalized existing-agent registry', () => {
     expect(bridge.profileForSession('scout-child')?.providerOptions).toEqual({
       visible: true,
     });
+  });
+
+  test('a display-only host override resolves both canonical and visible identities', () => {
+    const runtime = runtimeFor({
+      agents: {
+        explorer: { displayName: 'Scout', model: ['plugin/A', 'plugin/B'] },
+      },
+    });
+    const registry = build(runtime, {
+      agent: {
+        Scout: {
+          model: 'visible/V',
+          variant: 'visible-v',
+          temperature: 0.4,
+          options: { visible: true },
+        },
+      },
+    });
+    runtime.everModelSwitched('explorer');
+
+    // Real precedence: with no canonical override, the canonical entry falls
+    // back to the display-name host override, and the visible entry mirrors it.
+    expect(registry.effectiveStartupModels.explorer?.model).toBe('visible/V');
+    expect(registry.effectiveStartupModels.Scout?.model).toBe('visible/V');
+
+    const profiles = inferenceProfilesFromRegistry({
+      candidates: registry,
+      freshRuntime: runtime,
+      liveRuntime: runtime,
+    });
+
+    for (const key of ['explorer', 'Scout'] as const) {
+      expect(profiles[key]?.model).toEqual({
+        providerID: 'visible',
+        id: 'V',
+        variant: 'visible-v',
+      });
+      expect(profiles[key]?.temperature).toBe(0.4);
+      expect(profiles[key]?.providerOptions).toEqual({ visible: true });
+      expect(profiles[key]?.sidebarModel).toBe('visible/V');
+      expect(profiles[key]?.fallbackDisabled).toBe(true);
+    }
   });
 
   test('visible native rules backfill the canonical policy when no canonical rules exist', () => {

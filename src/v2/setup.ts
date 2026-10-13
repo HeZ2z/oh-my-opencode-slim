@@ -37,7 +37,10 @@ import {
 import { isCommandEnabled } from '../hooks/command-hook-utils';
 import { COUNCIL_INJECT_METADATA_KEY } from '../hooks/council-inject';
 import { GOAL_POINTER_METADATA_KEY } from '../hooks/deepwork-goal';
-import type { ForegroundFallbackManager } from '../hooks/foreground-fallback';
+import type {
+  BoundFallbackSnapshot,
+  ForegroundFallbackManager,
+} from '../hooks/foreground-fallback';
 import { PHASE_REMINDER_METADATA_KEY } from '../hooks/phase-reminder';
 import { BACKGROUND_JOB_BOARD_METADATA_KEY } from '../hooks/task-session-manager/board-injection';
 import { OhMyOpenCodeLite } from '../index';
@@ -85,7 +88,6 @@ import { createV2InterviewBridge } from './interview-bridge';
 import {
   applyRuntimeProfileOptions,
   createSessionProfileBridge,
-  type SessionFallbackBinding,
   type V2AgentRuntimeProfiles,
   type V2InferenceTable,
 } from './runtime-profiles';
@@ -2671,7 +2673,7 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         v1Hooks as unknown as {
           'v2.setFallbackResolver'?: (
             resolver:
-              | ((sessionID: string) => SessionFallbackBinding | undefined)
+              | ((sessionID: string) => BoundFallbackSnapshot | undefined)
               | undefined,
           ) => void;
         }
